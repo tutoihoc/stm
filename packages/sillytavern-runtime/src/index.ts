@@ -30,7 +30,8 @@ const MAX_ZIP_DIRECTORY_BYTES = 64 * 1024 * 1024;
 const GIT_REPOSITORY = `https://github.com/${REPOSITORY}.git`;
 const DEPENDENCY_MARKER = '.stm-dependencies.json';
 /** SillyTavern's own default, used when no console has said where it runs. */
-const DEFAULT_SILLYTAVERN_PORT = 8000;
+/** The port this console runs SillyTavern on; see SILLYTAVERN_PORT in the server. */
+const DEFAULT_SILLYTAVERN_PORT = 8002;
 
 /** How work running before the download says what it is doing. */
 export type BeforeInstallReport = (progress: number, step: LogEvent) => Promise<void>;
@@ -49,7 +50,7 @@ export interface RuntimeManagerOptions {
   readonly logger?: LogSink;
   readonly githubApiBaseUrl?: string;
   readonly npmCommand?: string;
-  readonly installDependencies?: (runtimePath: string, onLine: (line: string) => void) => Promise<void>;
+  readonly installDependencies?: (runtimePath: string, onLine: (line: string) => void, signal?: AbortSignal) => Promise<void>;
   readonly healthCheck?: (runtimePath: string, onLine?: (line: string) => void) => Promise<void>;
   readonly healthCheckTimeoutMs?: number;
   /**
@@ -92,7 +93,7 @@ export class RuntimeManager {
   private readonly logger: LogSink;
   private readonly githubApiBaseUrl: string;
   private readonly npmCommand: string;
-  private readonly installDependencies: (runtimePath: string, onLine: (line: string) => void) => Promise<void>;
+  private readonly installDependencies: (runtimePath: string, onLine: (line: string) => void, signal?: AbortSignal) => Promise<void>;
   private readonly healthCheck: (runtimePath: string, onLine?: (line: string) => void) => Promise<void>;
   private readonly healthCheckTimeoutMs: number;
   private readonly useGit: boolean;
@@ -110,7 +111,7 @@ export class RuntimeManager {
     this.logger = options.logger ?? ((line) => console.log(logLineText(line)));
     this.githubApiBaseUrl = (options.githubApiBaseUrl ?? GITHUB_API).replace(/\/$/u, '');
     this.npmCommand = options.npmCommand ?? 'npm';
-    this.installDependencies = options.installDependencies ?? ((path, log) => runNpmInstall(path, this.npmCommand, log));
+    this.installDependencies = options.installDependencies ?? ((path, log, signal) => runNpmInstall(path, this.npmCommand, log, signal));
     // SillyTavern performs content seeding and frontend compilation on its first
     // launch. Two minutes is too short for a free ModelScope/low-CPU workspace.
     this.healthCheckTimeoutMs = options.healthCheckTimeoutMs ?? 300_000;
@@ -302,11 +303,13 @@ export class RuntimeManager {
     selector: VersionSelector,
     onProgress?: (progress: InstallationProgress) => void,
     beforeInstall?: (report: BeforeInstallReport) => Promise<void>,
+    /** Stops the install and takes back everything it wrote; see INSTALL_CANCELED. */
+    signal?: AbortSignal,
   ): { id: string; promise: Promise<Installation> } {
     if (this.inFlightId) throw new RuntimeError('installation_busy', 'An installation is already in progress');
     const id = randomUUID();
     this.inFlightId = id;
-    const promise = this.installWithId(id, selector, onProgress, beforeInstall).finally(() => { this.inFlightId = null; });
+    const promise = this.installWithId(id, selector, onProgress, beforeInstall, signal).finally(() => { this.inFlightId = null; });
     return { id, promise };
   }
 
@@ -315,6 +318,7 @@ export class RuntimeManager {
     selector: VersionSelector,
     onProgress?: (progress: InstallationProgress) => void,
     beforeInstall?: (report: BeforeInstallReport) => Promise<void>,
+    signal?: AbortSignal,
   ): Promise<Installation> {
     const now = this.now().toISOString();
     const initial: Installation = {
@@ -335,9 +339,11 @@ export class RuntimeManager {
     const previous = await this.getActiveInstallation();
     let checkoutChanged = false;
     try {
+      throwIfCanceled(signal);
       const resolved = await this.resolveSelector(selector);
       await update('queued', 2, logEvent('install.resolved', `Resolved ${resolved.ref}`, { ref: resolved.ref }));
       await beforeInstall?.((progress, step) => update('queued', progress, step).then(() => undefined));
+      throwIfCanceled(signal);
       await rm(stagingRoot, { recursive: true, force: true });
       await mkdir(stagingRoot, { recursive: true });
       let extractedPath: string;
@@ -347,23 +353,25 @@ export class RuntimeManager {
         const sharedPath = this.runtimePathFor(id);
         checkoutChanged = true;
         await rm(join(sharedPath, MARKER_FILE), { force: true });
-        revision = await this.prepareGitCheckout(sharedPath, resolved.ref, (line) => this.logger(`[installer:${id}] ${line}`));
+        revision = await this.prepareGitCheckout(sharedPath, resolved.ref, (line) => this.logger(`[installer:${id}] ${line}`), undefined, signal);
         await update('extracting', 48, logEvent('install.checkedOut', `Checked out ${resolved.ref}`, { ref: resolved.ref }));
         extractedPath = sharedPath;
         finalRoot = sharedPath;
       } else {
         const zipPath = join(stagingRoot, 'source.zip');
         await update('downloading', 5, logEvent('install.downloading', `Downloading ${resolved.ref}`, { ref: resolved.ref }));
-        await this.downloadZip(resolved.ref, zipPath, (progress) => onProgress?.({ status: 'downloading', progress: 5 + progress * 0.4, step: logEvent('install.downloadingArchive', 'Downloading source archive') }));
+        await this.downloadZip(resolved.ref, zipPath, (progress) => onProgress?.({ status: 'downloading', progress: 5 + progress * 0.4, step: logEvent('install.downloadingArchive', 'Downloading source archive') }), signal);
         await update('extracting', 48, logEvent('install.extracting', 'Extracting source archive'));
         extractedPath = join(stagingRoot, 'runtime');
         await mkdir(extractedPath, { recursive: true });
-        await extractZipSafely(zipPath, extractedPath, (progress) => onProgress?.({ status: 'extracting', progress: 48 + progress * 0.2, step: logEvent('install.extracting', 'Extracting source archive') }));
+        await extractZipSafely(zipPath, extractedPath, (progress) => onProgress?.({ status: 'extracting', progress: 48 + progress * 0.2, step: logEvent('install.extracting', 'Extracting source archive') }), signal);
       }
       await update('installing', 70, logEvent('install.installingDependencies', 'Installing SillyTavern dependencies'));
-      await this.installDependenciesIfNeeded(extractedPath, (line) => this.logger(`[installer:${id}] ${line}`));
+      await this.installDependenciesIfNeeded(extractedPath, (line) => this.logger(`[installer:${id}] ${line}`), signal);
       await update('health_check', 90, logEvent('install.checking', 'Checking the installation'));
+      throwIfCanceled(signal);
       await this.healthCheck(extractedPath, (line) => this.logger(`[installer:${id}] ${line}`));
+      throwIfCanceled(signal);
       if (!this.useGit) {
         finalRoot = this.runtimePathFor(id);
         await mkdir(join(this.paths.profiles, id), { recursive: true });
@@ -379,6 +387,22 @@ export class RuntimeManager {
       this.logger(logEvent('installer.ready', `[installer:${id}] installation ${resolved.ref} is ready`, { ref: resolved.ref }));
       return activated;
     } catch (error: unknown) {
+      /*
+       * Stopped, rather than broken.
+       *
+       * Everything this install wrote goes back: the staging directory below,
+       * and - when there was nothing here before it - the shared checkout and
+       * the half-built node_modules inside it. A first install that is stopped
+       * has to leave the machine as it found it, or the next attempt meets a
+       * checkout it did not make and refuses to touch it. When there was a
+       * previous installation, that one is put back instead and its files are
+       * not this attempt's to remove.
+       */
+      if (error instanceof RuntimeError && error.code === INSTALL_CANCELED) {
+        const stopped = await this.cleanUpCanceledInstall(id, previous, checkoutChanged);
+        await rm(stagingRoot, { recursive: true, force: true });
+        return stopped;
+      }
       const message = error instanceof RuntimeError ? error.message : error instanceof Error ? error.message : 'Installation failed';
       // Only a refusal this manager wrote carries a code. A line from git or
       // npm is that program's own words and is shown as it arrived.
@@ -395,11 +419,43 @@ export class RuntimeManager {
     }
   }
 
+  /**
+   * Put the machine back the way a stopped install found it.
+   *
+   * With a previous installation there is one to go back to, so it is
+   * reactivated and the runtime stays where it is. With none, this install
+   * made the checkout, and what it made comes out - including the
+   * dependencies, because a node_modules killed partway through is worse than
+   * none at all: it looks installed and is not.
+   */
+  private async cleanUpCanceledInstall(id: string, previous: Installation | null, checkoutChanged: boolean): Promise<Installation> {
+    const record = await this.getInstallation(id);
+    const now = this.now().toISOString();
+    if (!previous && checkoutChanged) {
+      const base = resolve(this.paths.profiles);
+      const root = resolve(this.runtimePathFor(id));
+      if (root !== base && (root.startsWith(base + '/') || root.startsWith(base + '\\'))) {
+        await rm(root, { recursive: true, force: true });
+        this.logger(logEvent('installer.canceledCleanup', `[installer:${id}] the stopped installation was removed`, { id }));
+      }
+      await rm(join(this.paths.state, ACTIVE_FILE), { force: true });
+    } else if (previous) {
+      try { await this.activateInstallation(previous.id); this.logger(logEvent('installer.previousRestored', '[installer] previous runtime restored')); }
+      catch (error: unknown) { const reason = error instanceof Error ? error.message : 'unknown error'; this.logger(logEvent('installer.rollbackFailed', `[installer] rollback failed: ${reason}`, { reason })); }
+    }
+    // The record goes rather than standing in the list as a failure nobody had.
+    const remaining = (await this.listInstallations()).filter((installation) => installation.id !== id);
+    await this.writeInstallations(remaining);
+    this.logger(logEvent('installer.canceled', `[installer:${id}] the installation was stopped`, { id }));
+    return { ...(record ?? {} as Installation), id, status: 'failed', progress: 0, step: 'Installation stopped', stepCode: 'install.canceled', error: null, errorCode: INSTALL_CANCELED, updatedAt: now };
+  }
+
   private runtimePathFor(id: string): string {
     return this.useGit ? join(this.paths.profiles, 'runtime') : join(this.paths.profiles, id, 'runtime');
   }
 
-  private async installDependenciesIfNeeded(runtimePath: string, onLine: (line: string) => void): Promise<void> {
+  private async installDependenciesIfNeeded(runtimePath: string, onLine: (line: string) => void, signal?: AbortSignal): Promise<void> {
+    throwIfCanceled(signal);
     const fingerprint = await dependencyFingerprint(runtimePath);
     const markerPath = join(runtimePath, 'node_modules', DEPENDENCY_MARKER);
     if (await pathExists(join(runtimePath, 'node_modules'))) {
@@ -411,7 +467,8 @@ export class RuntimeManager {
         }
       } catch { /* missing or stale marker: install below */ }
     }
-    await this.installDependencies(runtimePath, onLine);
+    await this.installDependencies(runtimePath, onLine, signal);
+    throwIfCanceled(signal);
     await mkdir(join(runtimePath, 'node_modules'), { recursive: true });
     const temporary = `${markerPath}.${randomBytes(4).toString('hex')}.tmp`;
     await writeFile(temporary, `${JSON.stringify({ schemaVersion: 1, fingerprint })}\n`, { encoding: 'utf8', mode: 0o600 });
@@ -425,7 +482,8 @@ export class RuntimeManager {
     await rename(temporary, installation.markerPath);
   }
 
-  private async prepareGitCheckout(runtimePath: string, ref: string, onLine: (line: string) => void, pinnedRevision?: string): Promise<string> {
+  private async prepareGitCheckout(runtimePath: string, ref: string, onLine: (line: string) => void, pinnedRevision?: string, signal?: AbortSignal): Promise<string> {
+    throwIfCanceled(signal);
     await mkdir(dirname(runtimePath), { recursive: true });
     const gitDir = join(runtimePath, '.git');
     if (!await pathExists(gitDir)) {
@@ -481,9 +539,10 @@ export class RuntimeManager {
     return { ref: selector, channel: 'release' as const };
   }
 
-  private async downloadZip(ref: string, target: string, onProgress: (progress: number) => void): Promise<void> {
+  private async downloadZip(ref: string, target: string, onProgress: (progress: number) => void, signal?: AbortSignal): Promise<void> {
+    throwIfCanceled(signal);
     const url = `https://github.com/${REPOSITORY}/zipball/${encodeURIComponent(ref)}`;
-    const response = await this.fetcher(url, { headers: { accept: 'application/zip', 'user-agent': 'sillytavern-manager' }, redirect: 'follow' });
+    const response = await this.fetcher(url, { headers: { accept: 'application/zip', 'user-agent': 'sillytavern-manager' }, redirect: 'follow', ...(signal ? { signal } : {}) });
     if (!response.ok || !response.body) throw new RuntimeError('download_failed', `GitHub archive download failed (HTTP ${response.status})`);
     const expected = Number(response.headers.get('content-length') ?? 0);
     let received = 0;
@@ -552,6 +611,25 @@ export class RuntimeManager {
 export class RuntimeError extends Error {
   public readonly code: string;
   public constructor(code: string, message: string) { super(message); this.code = code; }
+}
+
+/**
+ * The code a stopped install carries, so it is told apart from one that broke.
+ *
+ * A first install is a Git fetch, an `npm install` and a start of SillyTavern:
+ * minutes on a fast machine and a good deal longer on a phone. Somebody who
+ * started it by mistake, or on the wrong version, had no way out but to leave
+ * the manager running until it finished. Stopping is not a failure and is not
+ * reported as one - but everything it half-wrote still has to go.
+ */
+export const INSTALL_CANCELED = 'install_canceled';
+
+function canceled(): RuntimeError {
+  return new RuntimeError(INSTALL_CANCELED, 'The installation was stopped');
+}
+
+function throwIfCanceled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw canceled();
 }
 
 async function probeRuntime(
@@ -666,7 +744,8 @@ async function removeTemporaryGitPacks(runtimePath: string): Promise<void> {
   await Promise.all(names.filter((name) => name.includes('tmp_pack') || name.endsWith('.tmp')).map((name) => rm(join(packDirectory, name), { force: true })));
 }
 
-async function runNpmInstall(runtimePath: string, npmCommand: string, onLine: (line: string) => void): Promise<void> {
+async function runNpmInstall(runtimePath: string, npmCommand: string, onLine: (line: string) => void, signal?: AbortSignal): Promise<void> {
+  throwIfCanceled(signal);
   const cacheDirectory = join(tmpdir(), 'sillytavern-manager-npm-cache');
   await mkdir(cacheDirectory, { recursive: true });
   await new Promise<void>((resolvePromise, reject) => {
@@ -675,6 +754,9 @@ async function runNpmInstall(runtimePath: string, npmCommand: string, onLine: (l
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       shell: process.platform === 'win32',
+      // Node kills the child when this fires, which is the whole of what
+      // stopping an install means while npm is the thing taking the minutes.
+      ...(signal ? { signal } : {}),
       env: {
         ...process.env,
         npm_config_cache: cacheDirectory,
@@ -689,15 +771,18 @@ async function runNpmInstall(runtimePath: string, npmCommand: string, onLine: (l
       stream.on('end', () => { if (pending.trim()) onLine(pending.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/gu, '')); });
     };
     consume(child.stdout); consume(child.stderr);
-    child.once('error', (error) => reject(new RuntimeError('npm_failed', `Could not start npm: ${error.message}`)));
-    child.once('close', (code) => code === 0 ? resolvePromise() : reject(new RuntimeError('npm_failed', `npm install exited with code ${code ?? 'unknown'}`)));
+    // An abort arrives here as the spawn's own AbortError. It is not npm
+    // failing, and must not be reported as one.
+    child.once('error', (error) => reject(signal?.aborted ? canceled() : new RuntimeError('npm_failed', `Could not start npm: ${error.message}`)));
+    child.once('close', (code) => code === 0 ? resolvePromise() : reject(signal?.aborted ? canceled() : new RuntimeError('npm_failed', `npm install exited with code ${code ?? 'unknown'}`)));
   });
 }
 
-async function runGit(gitCommand: string, args: readonly string[], onLine: (line: string) => void): Promise<string> {
+async function runGit(gitCommand: string, args: readonly string[], onLine: (line: string) => void, signal?: AbortSignal): Promise<string> {
+  throwIfCanceled(signal);
   return new Promise<string>((resolvePromise, reject) => {
     let output = '';
-    const child = spawn(gitCommand, [...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(gitCommand, [...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, ...(signal ? { signal } : {}) });
     child.stdout.on('data', (chunk: Buffer | string) => { output = (output + chunk.toString()).slice(-16_384); });
     const consume = (stream: NodeJS.ReadableStream) => {
       let pending = '';
@@ -706,12 +791,12 @@ async function runGit(gitCommand: string, args: readonly string[], onLine: (line
       stream.on('end', () => { if (pending.trim()) onLine(pending.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/gu, '')); });
     };
     consume(child.stdout); consume(child.stderr);
-    child.once('error', (error) => reject(new RuntimeError('git_failed', `Could not start git: ${error.message}`)));
-    child.once('close', (code) => code === 0 ? resolvePromise(output) : reject(new RuntimeError('git_failed', `git command exited with code ${code ?? 'unknown'}`)));
+    child.once('error', (error) => reject(signal?.aborted ? canceled() : new RuntimeError('git_failed', `Could not start git: ${error.message}`)));
+    child.once('close', (code) => code === 0 ? resolvePromise(output) : reject(signal?.aborted ? canceled() : new RuntimeError('git_failed', `git command exited with code ${code ?? 'unknown'}`)));
   });
 }
 
-export async function extractZipSafely(zipPath: string, destination: string, onProgress?: (progress: number) => void): Promise<void> {
+export async function extractZipSafely(zipPath: string, destination: string, onProgress?: (progress: number) => void, signal?: AbortSignal): Promise<void> {
   const entries = await readZipDirectory(zipPath);
   const files = entries.filter((entry) => !entry.directory);
   const topLevels = new Set(files.map((entry) => entry.name.split('/')[0]).filter((value): value is string => Boolean(value)));
@@ -719,6 +804,7 @@ export async function extractZipSafely(zipPath: string, destination: string, onP
   const written = new Set<string>();
   let completed = 0;
   for (const entry of entries) {
+    throwIfCanceled(signal);
     if (entry.directory) continue;
     if (entry.symlink) throw new RuntimeError('unsafe_archive', `Symlink entry is not allowed: ${entry.name}`);
     validateArchiveEntryName(entry.name);

@@ -42,6 +42,24 @@ export function isLocalHostname(hostname: string): boolean {
     || (first === 100 && second >= 64 && second <= 127);
 }
 
+/**
+ * Whether this hostname is the machine the console is running on.
+ *
+ * Narrower than `isLocalHostname`, and a different question: that one asks
+ * whether the reader got here without a platform in the middle, which a phone
+ * on the same Wi-Fi did. This asks whether the reader is *on* the machine - the
+ * only place a loopback address means anything, and the only place SillyTavern
+ * can be shown in a frame on this console's own origin.
+ *
+ * Written out rather than compared against two strings, because `[::1]` and
+ * `127.0.0.2` are this machine too and were being treated as somewhere else.
+ */
+export function isThisMachine(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/gu, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0.0.0.0' || host === '') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/u.test(host);
+}
+
 export interface TunnelOfferInput {
   /** The address the console is being read at, from the browser. */
   readonly hostname: string;

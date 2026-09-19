@@ -27,14 +27,44 @@ test('copies legacy public layout into the canonical data profile', async () => 
   const paths = getPlatformPaths({ platform: 'linux', env: { STM_DATA_DIR: root } });
   const store = new ProfileStore({ paths });
   await mkdir(runtimePath, { recursive: true });
-  await mkdir(join(runtimePath, 'public'), { recursive: true });
-  await writeFile(join(runtimePath, 'public', 'chat.json'), '{}', 'utf8');
+  // An old SillyTavern: the pages and the reader's data in one directory.
+  await mkdir(join(runtimePath, 'public', 'chats'), { recursive: true });
+  await writeFile(join(runtimePath, 'public', 'settings.json'), '{}', 'utf8');
+  await writeFile(join(runtimePath, 'public', 'index.html'), '<!doctype html>', 'utf8');
+  await writeFile(join(runtimePath, 'public', 'chats', 'chat.json'), '{}', 'utf8');
   const profile = await store.ensureDefault({ installationId: 'install-1', runtimePath });
   assert.equal(profile.layout, 'data');
   assert.equal(profile.legacyLayout, 'public');
   assert.equal(profile.dataPath.endsWith(join('data')), true);
-  assert.equal(await readFile(join(profile.dataPath, 'default-user', 'chat.json'), 'utf8'), '{}');
-  assert.equal(await readFile(join(runtimePath, 'public', 'chat.json'), 'utf8'), '{}');
+  assert.equal(await readFile(join(profile.dataPath, 'default-user', 'chats', 'chat.json'), 'utf8'), '{}');
+  assert.equal(await readFile(join(runtimePath, 'public', 'chats', 'chat.json'), 'utf8'), '{}');
+});
+
+test('a modern public/ is the program, not a profile, and is left where it is', async () => {
+  /*
+   * Every SillyTavern has a `public/`. Only the old ones keep data in it.
+   *
+   * Taking its existence as the signal meant a first install copied the web
+   * root - index.html, the scripts, the fonts - into a brand new profile: tens
+   * of megabytes of the program filed as the reader's data, uploaded to their
+   * bucket as their data, and a profile that looked used before it had been.
+   * That last part is what stopped a machine set up from nothing having its
+   * recovery point put back: it is only ever put into a profile with nothing
+   * in it, and this one was full of SillyTavern.
+   */
+  const root = await mkdtemp(join(tmpdir(), 'stm-profile-modern-'));
+  const runtimePath = join(root, 'runtime');
+  const paths = getPlatformPaths({ platform: 'linux', env: { STM_DATA_DIR: root } });
+  const store = new ProfileStore({ paths });
+  await mkdir(join(runtimePath, 'public', 'scripts'), { recursive: true });
+  await writeFile(join(runtimePath, 'public', 'index.html'), '<!doctype html>', 'utf8');
+  await writeFile(join(runtimePath, 'public', 'script.js'), 'export {};', 'utf8');
+  await writeFile(join(runtimePath, 'public', 'scripts', 'power-user.js'), 'export {};', 'utf8');
+
+  const profile = await store.ensureDefault({ installationId: 'install-1', runtimePath });
+  assert.equal(profile.layout, 'data');
+  assert.equal(profile.legacyLayout, null);
+  assert.deepEqual(await readdir(profile.dataPath), [], 'a new profile starts with nothing in it');
 });
 
 test('activation switches the active profile and leaves each profile’s data alone', async () => {

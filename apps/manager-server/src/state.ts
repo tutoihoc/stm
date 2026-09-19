@@ -43,6 +43,26 @@ interface PersistedManagerState {
   readonly setupAcceptedAt: string | null;
   readonly termsVersion: string;
   readonly telemetryNoticeVersion: string;
+  /**
+   * Whether SillyTavern is started when the manager is.
+   *
+   * On, because the manager exists to run SillyTavern and a console that has
+   * to be told to start it every time is one step in front of the thing
+   * everybody actually opened it for. Off is for somebody who runs SillyTavern
+   * themselves, or who opens the console to look at backups on a machine they
+   * do not want a second process on.
+   */
+  readonly autoStartSillyTavern: boolean;
+  /**
+   * When the manager installed SillyTavern by itself, if it ever did.
+   *
+   * A fresh manager with a password just set has nothing installed and one
+   * obvious next step, and making the reader find and press it is asking them
+   * to confirm the only thing the program does. It is done once and recorded,
+   * so somebody who later removes SillyTavern on purpose does not find it
+   * installing itself again on the next start.
+   */
+  readonly firstInstallStartedAt: string | null;
 }
 
 export interface StateStoreOptions {
@@ -105,6 +125,8 @@ export class StateStore {
         setupAcceptedAt: null,
         termsVersion: TERMS_VERSION,
         telemetryNoticeVersion: TELEMETRY_NOTICE_VERSION,
+        autoStartSillyTavern: true,
+        firstInstallStartedAt: null,
       };
       await this.write(state);
       this.state = state;
@@ -165,6 +187,44 @@ export class StateStore {
     const previous = this.adminWriteQueue;
     this.adminWriteQueue = previous.then(operation, operation);
     await this.adminWriteQueue;
+  }
+
+  /** Whether SillyTavern comes up with the manager. */
+  public async setAutoStartSillyTavern(enabled: boolean): Promise<void> {
+    const operation = async (): Promise<void> => {
+      const state = await this.load();
+      if (state.autoStartSillyTavern === enabled) return;
+      const updated: PersistedManagerState = { ...state, autoStartSillyTavern: enabled, updatedAt: this.now().toISOString() };
+      await this.write(updated);
+      this.state = updated;
+    };
+    const previous = this.adminWriteQueue;
+    this.adminWriteQueue = previous.then(operation, operation);
+    await this.adminWriteQueue;
+  }
+
+  /**
+   * Claim the one automatic first install, or find that it is already claimed.
+   *
+   * True exactly once per installation of the manager. Written through the
+   * same queue as everything else here, so two requests arriving together
+   * cannot both be told to go ahead.
+   */
+  public async claimFirstInstall(): Promise<boolean> {
+    let claimed = false;
+    const operation = async (): Promise<void> => {
+      const state = await this.load();
+      if (state.firstInstallStartedAt !== null) return;
+      const now = this.now().toISOString();
+      const updated: PersistedManagerState = { ...state, firstInstallStartedAt: now, updatedAt: now };
+      await this.write(updated);
+      this.state = updated;
+      claimed = true;
+    };
+    const previous = this.adminWriteQueue;
+    this.adminWriteQueue = previous.then(operation, operation);
+    await this.adminWriteQueue;
+    return claimed;
   }
 
   public async setAccessLan(enabled: boolean): Promise<void> {
@@ -298,7 +358,13 @@ export class StateStore {
     const sillyTavernPort = typeof storedPort === 'number' && Number.isInteger(storedPort) && storedPort > 0 && storedPort <= 65535
       ? storedPort
       : SILLYTAVERN_PORT;
-    return { ...input, accessPasswordHash, accessPasscode, accessLanEnabled, sillyTavernPort } as unknown as PersistedManagerState;
+    // Absent in a file written before these existed. The first is on by
+    // default, so only an explicit `false` turns it off; the second says the
+    // automatic install has not happened, which for an existing installation
+    // is settled a moment later by there already being one.
+    const autoStartSillyTavern = input.autoStartSillyTavern !== false;
+    const firstInstallStartedAt = isNullableString(input.firstInstallStartedAt) ? input.firstInstallStartedAt : null;
+    return { ...input, accessPasswordHash, accessPasscode, accessLanEnabled, sillyTavernPort, autoStartSillyTavern, firstInstallStartedAt } as unknown as PersistedManagerState;
   }
 }
 

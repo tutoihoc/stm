@@ -163,6 +163,10 @@ test('a machine that came back empty puts its profile back from the bucket by it
   });
   assert.ok(manifest, 'the newest recovery point in the bucket is brought back');
   assert.equal(restored.length, 1);
+  // Which recovery point came back, so the console can say when the data it is
+  // showing was taken rather than when the archive carrying it was written.
+  assert.equal(manifest.point.profileId, 'profile-1');
+  assert.equal(manifest.manifest.kind, 'r2');
   assert.equal(await readFile(join(second.dataRoot, 'settings.json'), 'utf8'), '{"theme":"dark"}');
   assert.deepEqual(await readFile(join(second.dataRoot, 'chats', 'long.jsonl')), chat);
 });

@@ -514,6 +514,9 @@
 .runtime-select { min-width: 12rem; }
 .runtime-progress { display: grid !important; gap: 6px; }
 .runtime-progress .progress-track { width: min(20rem, 100%); }
+/* Under the bar rather than beside it: the row is a label and a value, and a
+   button on the value's line would sit against the percentage. */
+.runtime-progress-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
 /* Where the other addresses are, rather than a second copy of them. The
    sharing addresses belong to the card that turns them on; saying them twice
    is how one of the two ends up out of date. */
@@ -669,8 +672,13 @@
 .address-absent { color: var(--muted-foreground); }
 .share-dialog { max-width: 22rem; }
 .share-body { display: grid; justify-items: center; gap: 12px; }
-.share-url { color: var(--muted-foreground); font-size: 12.5px; text-align: center; overflow-wrap: anywhere; }
-.share-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+/* A link now, not a label: the sheet has no buttons under it any more, so
+   opening the address is done by pressing the address. */
+.share-url { color: var(--muted-foreground); font-size: 12.5px; text-align: center; overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, monospace); text-decoration: underline; text-underline-offset: 3px; }
+.share-url:hover, .share-url:focus-visible { color: var(--foreground); }
+/* One line per address, each of them a link. A place can answer on two - a
+   Worker with a fixed name and the tunnel behind it - and both belong here. */
+.share-links { display: grid; gap: 6px; justify-items: center; }
 .share-actions > * { width: 100%; }
 .qr-code { border-radius: 8px; }
 .qr-quiet-zone { fill: #fff; }
@@ -702,6 +710,40 @@
   text-transform: uppercase;
 }
 .access-badge svg { width: 12px; height: 12px; fill: currentColor; stroke-width: 1.5; }
+
+/*
+ * The one card on this page that is asking for something.
+ *
+ * Every other card reports on what the machine is already doing. This one is a
+ * proposal - the copy off this machine that nothing else on the page can offer
+ * - and it was drawn exactly like the panels around it, which is to say as
+ * furniture. The tinted edge and the wash behind the heading are the same move
+ * the overview makes for the tunnel, for the same reason: the thing worth
+ * trying should not look like the thing already running.
+ */
+.cloud-card {
+  position: relative;
+  border-color: color-mix(in srgb, var(--primary) 34%, var(--border));
+  box-shadow: 0 1px 2px rgb(0 0 0 / .04), 0 10px 28px -20px color-mix(in srgb, var(--primary) 70%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--primary) 5%, transparent) 0, transparent 128px),
+    var(--card);
+}
+.cloud-card [data-slot="card-header"] svg { color: var(--primary); }
+/* The reason to turn it on, said once, above the switches that turn it on. */
+.cloud-pitch {
+  display: flex;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.cloud-pitch svg { flex-shrink: 0; width: 17px; height: 17px; margin-top: 1px; color: var(--primary); }
+
 .access-row span { color: var(--muted-foreground); font-size: 12px; }
 [data-tour="logs"] { grid-column: 1 / -1; height: 28rem; min-height: 0; overflow: hidden; padding-bottom: 0; }
 [data-tour="logs"] [data-slot="card-header"] { flex-shrink: 0; }

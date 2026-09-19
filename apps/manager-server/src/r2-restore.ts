@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 import { readdir } from 'node:fs/promises';
-import { logEvent, type BackupManifest, type LogSink, type Profile, type RestorePreview, type TransferProgress } from '../../../packages/contracts/src/index.js';
+import { logEvent, type BackupManifest, type LogSink, type Profile, type R2SnapshotSummary, type RestorePreview, type TransferProgress } from '../../../packages/contracts/src/index.js';
 import { BackupStore, type ImportEntry } from '../../../packages/backup/src/index.js';
 import { R2Manager } from '../../../packages/r2/src/index.js';
 import type { HashedFile } from '../../../packages/r2/src/sync.js';
@@ -169,9 +169,10 @@ export interface RecoverProfileOptions {
  * points, a fetch that fails - leaves the profile exactly as it was and says so
  * in the log.
  *
- * Returns what was restored, or null when there was nothing to do.
+ * Returns the recovery point that came back and the archive it arrived as, or
+ * null when there was nothing to do.
  */
-export async function recoverProfileFromR2(options: RecoverProfileOptions): Promise<BackupManifest | null> {
+export async function recoverProfileFromR2(options: RecoverProfileOptions): Promise<{ manifest: BackupManifest; point: R2SnapshotSummary } | null> {
   const { profile, r2, backups, logger } = options;
   if (!await isProfileEmpty(profile)) return null;
   let candidate;
@@ -200,7 +201,7 @@ export async function recoverProfileFromR2(options: RecoverProfileOptions): Prom
     if (!archivePath) throw new Error('the fetched recovery point could not be found in the backup library');
     await options.restore(archivePath);
     logger?.(logEvent('r2.recovered', `[r2] the recovery point from ${candidate.createdAt} is back in this profile`, { createdAt: candidate.createdAt }));
-    return manifest;
+    return { manifest, point: candidate };
   } catch (error: unknown) {
     logger?.(logEvent('r2.recoveryFailed', `[r2] the recovery point could not be brought back: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' }));
     return null;

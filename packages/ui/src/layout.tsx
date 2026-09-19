@@ -142,8 +142,14 @@ export function DetailRow({
       {/* `flex-1` and a `minmax(0, 1fr)` track, not only `min-w-0`: an auto
           grid track is sized by its content, so one long value - a file path,
           a bucket name - widened the row until the card scrolled sideways
-          rather than being clipped where it asked to be. */}
-      <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)] gap-0.5">
+          rather than being clipped where it asked to be.
+
+          `basis-44` is what makes the wrap in `flex-wrap` above actually
+          happen. With `min-w-0` alone the label had no width it would not give
+          up, so a row whose buttons were wide squeezed the name into a column
+          one word across - "Lần gửi gần nhất" stacked four lines high beside
+          them. Below eleven rem the buttons go to a line of their own instead. */}
+      <div className="grid min-w-0 flex-1 basis-44 grid-cols-[minmax(0,1fr)] gap-0.5">
         <span className="text-sm font-medium">{label}</span>
         {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
       </div>

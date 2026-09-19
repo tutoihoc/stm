@@ -6,7 +6,10 @@ import { logEvent, logLineText, type ConfigDocument, type ConfigSettings, type C
 
 const CONFIG_SCHEMA_VERSION = 1 as const;
 /** SillyTavern's own default, and what the console uses until it is told otherwise. */
-const DEFAULT_SILLYTAVERN_PORT = 8000;
+/** The port this console runs SillyTavern on; see SILLYTAVERN_PORT in the server. */
+const DEFAULT_SILLYTAVERN_PORT = 8002;
+/** What SillyTavern falls back on when its config names no port. */
+const SILLYTAVERN_OWN_PORT = 8000;
 const REDACTED_PASSWORD = '********';
 const DEFAULT_BASIC_AUTH_USER = { username: 'user', password: 'password' } as const;
 /**
@@ -223,7 +226,9 @@ function extractSettings(document: Document.Parsed): ConfigSettings {
       ipv6: getString(['listenAddress', 'ipv6'], '[::]'),
     },
     whitelistMode: getBoolean(['whitelistMode'], true),
-    port: typeof portValue === 'number' ? portValue : 8000,
+    // A file that names no port is one SillyTavern would run on its own 8000.
+    // That is a statement about the file, not about what this console asks for.
+    port: typeof portValue === 'number' ? portValue : SILLYTAVERN_OWN_PORT,
     enableUserAccounts: getBoolean(['enableUserAccounts'], false),
     basicAuthMode: getBoolean(['basicAuthMode'], false),
     sslEnabled: getBoolean(['ssl', 'enabled'], false),

@@ -55,3 +55,38 @@ test('the system snapshot reports the host and measures directory sizes in the b
   const third = await measured(store, 1000);
   assert.equal(third.storage.dataFileCount, 3);
 });
+
+test('a profile appearing where there was none is measured without waiting out the interval', async () => {
+  /*
+   * The first install.
+   *
+   * The sizes are served from the last walk for five minutes, which is right
+   * while the question stays the same. It stopped being the same question the
+   * moment a profile existed: the cached answer was about a machine that had
+   * none, and the overview went on saying "Measuring..." for the rest of the
+   * interval - on the one screen somebody who has just installed is watching
+   * for a number.
+   */
+  const root = await mkdtemp(join(tmpdir(), 'stm-system-new-'));
+  const dataRoot = join(root, 'profiles', 'data');
+  const paths = getPlatformPaths({ platform: 'linux', env: { STM_DATA_DIR: root } });
+  let profile: string | null = null;
+  const store = new SystemStore({ paths, dataRoot: async () => profile });
+
+  await store.snapshot();
+  for (let attempt = 0; attempt < 400 && (await store.snapshot()).storage.measuredAt === null; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const empty = await store.snapshot();
+  assert.ok(empty.storage.measuredAt !== null, 'the machine itself is measured before any profile exists');
+  assert.equal(empty.storage.dataBytes, null);
+
+  await mkdir(join(dataRoot, 'chats'), { recursive: true });
+  await writeFile(join(dataRoot, 'chats', 'one.jsonl'), 'x'.repeat(640), 'utf8');
+  profile = dataRoot;
+
+  // No remeasure() and no waiting: the next ordinary poll notices that what it
+  // is being asked about has changed.
+  const withProfile = await measured(store, 640);
+  assert.equal(withProfile.storage.dataFileCount, 1);
+});

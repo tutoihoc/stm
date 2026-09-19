@@ -18,8 +18,18 @@ import { createServer } from 'node:net';
 export const MANAGER_PORT = 7860 as const;
 /** Where the access gateway listens. `STM_ACCESS_PORT` moves it. */
 export const ACCESS_GATEWAY_PORT = 8001 as const;
-/** What SillyTavern is started on unless the console has been told otherwise. */
-export const SILLYTAVERN_PORT = 8000 as const;
+/**
+ * What SillyTavern is started on unless the console has been told otherwise.
+ *
+ * Not SillyTavern's own 8000. That number is the one every other copy of
+ * SillyTavern on the machine also asks for - an existing install started by
+ * hand, a second manager, a container someone forwarded - so a console that
+ * takes it is the one most likely to find it held, and to hold it against
+ * somebody else. 8002 is out of that way, and the console writes it into the
+ * profile's `config.yaml` so SillyTavern is asking for it rather than being
+ * moved off 8000 afterwards.
+ */
+export const SILLYTAVERN_PORT = 8002 as const;
 
 /**
  * Ports below this need privileges on Unix that the manager does not ask for,

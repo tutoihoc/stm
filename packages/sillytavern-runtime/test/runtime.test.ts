@@ -68,6 +68,55 @@ test('version discovery keeps latest, release, staging, and tags', async () => {
   assert.equal(versions[3]?.selector, '1.2.3');
 });
 
+test('a first installation can be stopped, and takes back everything it wrote', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'stm-install-stop-'));
+  const repository = join(root, 'source');
+  await exec('git', ['init', repository]);
+  await exec('git', ['-C', repository, 'config', 'user.email', 'stm@test.local']);
+  await exec('git', ['-C', repository, 'config', 'user.name', 'STM Test']);
+  await writeFile(join(repository, 'package.json'), '{"name":"sillytavern","scripts":{"start":"node server.js"}}', 'utf8');
+  await writeFile(join(repository, 'server.js'), 'module.exports = "one";\n', 'utf8');
+  await exec('git', ['-C', repository, 'add', '.']); await exec('git', ['-C', repository, 'commit', '-m', 'one']); await exec('git', ['-C', repository, 'tag', '1.0.0']);
+  const paths = getPlatformPaths({ platform: 'linux', env: { STM_DATA_DIR: join(root, 'manager') } });
+
+  // Stopped while npm is the thing taking the minutes, which is where a first
+  // install spends nearly all of its time and where somebody who started it by
+  // mistake will reach for the button.
+  const stopping = new AbortController();
+  let reachedDependencies = false;
+  const runtime = new RuntimeManager({
+    paths,
+    useGit: true,
+    repositoryUrl: repository,
+    healthCheck: async () => undefined,
+    installDependencies: async (runtimePath, _onLine, signal) => {
+      reachedDependencies = true;
+      // Half a node_modules, of the kind a killed npm leaves behind.
+      await mkdir(join(runtimePath, 'node_modules', 'half-written'), { recursive: true });
+      stopping.abort();
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+      if (signal?.aborted) throw new RuntimeError('install_canceled', 'The installation was stopped');
+    },
+  });
+
+  const queued = runtime.queueInstall('1.0.0', undefined, undefined, stopping.signal);
+  const stopped = await queued.promise;
+  assert.equal(reachedDependencies, true);
+  assert.equal(stopped.errorCode, 'install_canceled');
+  // Not reported as a failure: nothing went wrong, somebody changed their mind.
+  assert.equal(stopped.error, null);
+
+  // Nothing of it is left: no checkout, no dependencies, no record standing in
+  // the list, and nothing named as the installation to run.
+  await assert.rejects(() => stat(join(paths.profiles, 'runtime')));
+  assert.deepEqual(await runtime.listInstallations(), []);
+  assert.equal(await runtime.getActiveInstallation(), null);
+
+  // And the machine is in a state a second attempt can use.
+  const installed = await runtime.install('1.0.0');
+  assert.equal(installed.status, 'ready');
+});
+
 test('safe extraction strips GitHub root and rejects zip slip', async () => {
   const root = await mkdtemp(join(tmpdir(), 'stm-extract-'));
   const archive = join(root, 'source.zip');

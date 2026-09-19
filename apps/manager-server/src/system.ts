@@ -42,6 +42,21 @@ export class SystemStore {
   private managerSize: MeasuredSize | null = null;
   private dataSize: MeasuredSize | null = null;
   private measuring = false;
+  /** A check is in flight, which is not yet a walk: the walk may be skipped. */
+  private checking = false;
+  /**
+   * The profile directory the last walk covered, so a different one is noticed.
+   *
+   * The sizes are served from the last walk for five minutes, which is right
+   * while the question stays the same. It stops being the same question the
+   * moment a profile appears where there was none - the first install - or the
+   * active profile changes: the cached answer is then about a directory nobody
+   * is asking about, and the panel sat on "Measuring..." until the interval ran
+   * out, on the one screen where a new user is watching for a number. The walk
+   * is redone when the subject of it changes.
+   */
+  private measuredRoot: string | null = null;
+  private measuredRootKnown = false;
 
   public constructor(options: SystemStoreOptions) {
     this.paths = options.paths;
@@ -120,14 +135,20 @@ export class SystemStore {
   }
 
   private scheduleSizeRefresh(force = false): void {
-    if (this.measuring) return;
+    if (this.checking) return;
     const measuredAt = this.dataSize?.measuredAt ?? this.managerSize?.measuredAt;
-    if (!force && measuredAt && this.now().getTime() - Date.parse(measuredAt) < SIZE_TTL_MS) return;
-    this.measuring = true;
+    const fresh = !force && measuredAt !== undefined && this.now().getTime() - Date.parse(measuredAt) < SIZE_TTL_MS;
+    this.checking = true;
     void (async () => {
       try {
-        const limiter = createIoLimiter(ioConcurrency());
         const root = await this.dataRoot();
+        // Asked after the freshness check rather than before it, because it is
+        // the one thing that can make a fresh reading stale: a reading of a
+        // directory that is no longer the one being asked about. Nothing is
+        // reported as being measured until this decides there is a walk.
+        if (fresh && this.measuredRootKnown && this.measuredRoot === root) return;
+        this.measuring = true;
+        const limiter = createIoLimiter(ioConcurrency());
         const [manager, data] = await Promise.all([
           measureTree(this.paths.root, limiter),
           root ? measureTree(root, limiter) : Promise.resolve({ bytes: 0, fileCount: 0 }),
@@ -135,10 +156,13 @@ export class SystemStore {
         const stamp = this.now().toISOString();
         this.managerSize = { ...manager, measuredAt: stamp };
         this.dataSize = root ? { ...data, measuredAt: stamp } : null;
+        this.measuredRoot = root;
+        this.measuredRootKnown = true;
       } catch {
         // Keep the previous reading; the next poll asks again.
       } finally {
         this.measuring = false;
+        this.checking = false;
       }
     })();
   }

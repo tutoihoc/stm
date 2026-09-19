@@ -140,7 +140,8 @@ test('a size or a count that SillyTavern could not read is refused', async () =>
 
 test('keys a version does not understand are not invented for it', async () => {
   const { store, profile, installation, configPath } = await fixture();
-  await writeFile(configPath, 'listen: false\nport: 8000\n', 'utf8');
+  // Already on the port the console hands out, so there is nothing to change.
+  await writeFile(configPath, 'listen: false\nport: 8002\n', 'utf8');
   assert.equal(await store.applyManagedDefaults(profile, installation), false);
   await store.update(profile, installation, { settings: { lazyLoadCharacters: true } });
   const raw = parseYaml(await readFile(configPath, 'utf8'));
@@ -154,7 +155,7 @@ test('the managed port cannot be moved out from under the manager', async () => 
   // The console hands the port out, having checked it against its own and the
   // gateway's, so an edited document is put back rather than refused.
   const saved = await store.update(profile, installation, { rawYaml: 'listen: false\nport: 9000\n' });
-  assert.equal(saved.settings.port, 8000);
+  assert.equal(saved.settings.port, 8002);
 });
 
 test('the port the console was given is the one written, even into a file that never mentioned it', async () => {

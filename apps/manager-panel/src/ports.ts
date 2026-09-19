@@ -9,7 +9,7 @@ export const LOWEST_PORT = 1024;
 export const HIGHEST_PORT = 65535;
 
 /** What SillyTavern runs on until the server has said otherwise. */
-export const DEFAULT_SILLYTAVERN_PORT = 8000;
+export const DEFAULT_SILLYTAVERN_PORT = 8002;
 
 /**
  * Why a typed port cannot be used, as a message to look up, or null.

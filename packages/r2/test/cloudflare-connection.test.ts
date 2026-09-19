@@ -211,3 +211,48 @@ test('disconnecting removes this installation\'s Worker key, revokes the grant a
   assert.doesNotMatch(await readFile(join(paths.state, 'cloudflare-connection.json'), 'utf8'), /refresh-/u);
   await assert.rejects(connection.objectStore(() => undefined).getObject('sillytavern-manager/blobs/a'), (error: unknown) => error instanceof R2Error && error.code === 'r2_not_configured');
 });
+
+test('an account that has never turned R2 on says so, and stays where it can be changed', async () => {
+  /*
+   * The sign-in worked and every permission asked for was granted. There is
+   * simply no R2 on this account to put a bucket in, and Cloudflare says so
+   * with a code of its own. Told apart from every other refusal because it is
+   * the only one the reader fixes in a minute, on a page the panel links to.
+   */
+  const { connection } = await setup({ r2Enabled: false, accounts: [{ id: ACCOUNT_ID, name: 'Personal' }, { id: OTHER_ACCOUNT_ID, name: 'Team' }] });
+  const offered = await connect(connection);
+  assert.equal(offered.state, 'choose_account');
+  await assert.rejects(connection.chooseAccount(ACCOUNT_ID), (error: unknown) => error instanceof R2Error && error.code === 'cloudflare_r2_not_enabled');
+
+  const status = await connection.status();
+  assert.equal(status.problem, 'r2_not_enabled');
+  // Still on the account picker, with the account that was picked remembered
+  // and the others still offered: the reader is coming back here after turning
+  // R2 on, and may want to try the other account instead.
+  assert.equal(status.state, 'choose_account');
+  assert.equal(status.account?.name, 'Personal');
+  assert.deepEqual(status.accounts.map((account) => account.name), ['Personal', 'Team']);
+  assert.equal(status.bucket, null);
+});
+
+test('turning R2 on and choosing again clears the refusal', async () => {
+  const { connection, cloudflare } = await setup({ r2Enabled: false });
+  /*
+   * One account, so signing in picks it without asking - and the refusal
+   * arrives as the sign-in itself failing rather than at a picker. The grant is
+   * kept either way: it was given, it works, and the only thing missing is on
+   * Cloudflare's side. What the reader comes back to is an account already
+   * chosen, waiting to be tried again.
+   */
+  await assert.rejects(connect(connection), (error: unknown) => error instanceof R2Error && error.code === 'cloudflare_r2_not_enabled');
+  const refused = await connection.status();
+  assert.equal(refused.problem, 'r2_not_enabled');
+  assert.equal(refused.state, 'choose_account');
+  assert.equal(refused.account?.id, ACCOUNT_ID);
+
+  cloudflare.state.r2Enabled = true;
+  const status = await connection.chooseAccount(ACCOUNT_ID);
+  assert.equal(status.state, 'connected');
+  assert.equal(status.problem, null);
+  assert.equal(status.bucket, 'sillytavern-manager-backup');
+});

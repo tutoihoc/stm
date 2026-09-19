@@ -432,3 +432,52 @@ test('reading a recovery point back is counted as reads, not as writes', async (
   const after = (await manager.getConfig()).usage;
   assert.ok(after.readOperations - before.readOperations >= 3, `expected at least three reads, got ${after.readOperations - before.readOperations}`);
 });
+
+test('the bucket lists every profile it holds, and one check reports what is in it', async () => {
+  /*
+   * A machine set up today has a profile identifier the bucket has never seen.
+   *
+   * Asking the bucket for its own recovery points then comes back with none,
+   * over a bucket holding somebody's whole history - which is exactly the
+   * moment, just after connecting, when they most need to see it is there.
+   */
+  const bucket = fakeBucket();
+  const { manager, root } = await createManager({ fetchImpl: bucket.fetchImpl });
+  const chat = await source(root, 'chats/one.jsonl', 'x'.repeat(5000));
+  const older = { ...profile(), id: 'profile-from-a-machine-that-is-gone' };
+  await manager.syncProfile({ profile: older, sources: [chat], fingerprint: 'one' });
+  await manager.syncProfile({ profile: profile(), sources: [chat], fingerprint: 'two' });
+
+  const mine = await manager.listSnapshots(profile().id);
+  assert.equal(mine.length, 1);
+  const all = await manager.listSnapshots();
+  assert.equal(all.length, 2);
+  assert.deepEqual([...new Set(all.map((snapshot) => snapshot.profileId))].sort(), ['profile-1', 'profile-from-a-machine-that-is-gone']);
+
+  // One look, and what it found stays: the three buttons this replaced each
+  // answered part of this and said so in a notification that went away.
+  const listings = bucket.requests.list;
+  const check = await manager.inspect();
+  assert.equal(check.ok, true);
+  assert.equal(check.failure, null);
+  assert.equal(check.bucket, CREDENTIALS.bucket);
+  assert.equal(check.snapshotCount, 2);
+  assert.equal(check.objectCount, bucket.objects.size);
+  assert.equal(check.totalBytes, [...bucket.objects.values()].reduce((sum, body) => sum + body.byteLength, 0));
+  assert.ok(bucket.requests.list > listings, 'the bucket is actually read');
+  // The counts the card shows are the ones that were just listed, not the ones
+  // the manager had been keeping in its head since it last looked.
+  const config = await manager.getConfig();
+  assert.equal(config.usage.snapshotCount, check.snapshotCount);
+  assert.equal(config.usage.storageBytes, check.totalBytes);
+});
+
+test('a bucket that cannot be read reports the reason instead of throwing it away', async () => {
+  const fetchImpl: typeof fetch = async () => new Response('<Error><Code>AccessDenied</Code></Error>', { status: 403 });
+  const { manager } = await createManager({ fetchImpl });
+  const check = await manager.inspect();
+  assert.equal(check.ok, false);
+  assert.equal(check.usage, null);
+  assert.ok(check.failure, 'the refusal is a finding, not a broken request');
+  assert.ok((check.failure?.message ?? '').length > 0);
+});

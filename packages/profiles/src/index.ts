@@ -12,6 +12,17 @@ const PROFILE_SCHEMA_VERSION = 1 as const;
 const DEFAULT_USER_HANDLE = 'default-user';
 const MIGRATION_COPY_NAMES = new Set(['_migration']);
 const LEGACY_RUNTIME_STATIC_NAMES = new Set(['assets', 'css', 'favicon.ico', 'i18n.json', 'img', 'index.html', 'jsconfig.json', 'lib', 'robots.txt', 'script.js', 'scripts', 'sounds', 'st-launcher.ico', 'style.css', 'webfonts']);
+/**
+ * Names that only ever appear in somebody's data, never in a web root.
+ *
+ * Old SillyTavern releases kept the user's data inside `public/`, alongside the
+ * pages and scripts the browser loads; current ones keep `public/` for the
+ * pages alone and the data in `data/`. Both have a `public/`, so its existence
+ * says nothing - what says it is whether there is anything of the reader's in
+ * there. Chats, characters, worlds and `settings.json` are theirs; `index.html`
+ * and `scripts/` are the program's.
+ */
+const LEGACY_DATA_NAMES = ['settings.json', 'chats', 'characters', 'groups', 'group chats', 'worlds', 'backgrounds', 'User Avatars'];
 
 export interface ProfileStoreOptions {
   readonly paths: PlatformPaths;
@@ -92,7 +103,14 @@ export class ProfileStore {
       runtimePath: input.runtimePath,
       layout: 'data',
     }, true);
-    if (await exists(join(input.runtimePath, 'public'))) return this.migrateRuntimePublic(created, input.runtimePath);
+    // A `public/` with the reader's data in it is an old profile to be carried
+    // over. A `public/` with only the program's own pages in it is this
+    // version's web root, and copying that into a new profile filled it with
+    // twenty-odd megabytes of SillyTavern's own scripts and fonts before
+    // anybody had used it - which then went up to the bucket as their data, and
+    // left the profile looking used, so a machine that should have had its
+    // recovery point put back was told it already had something.
+    if (await holdsUserData(join(input.runtimePath, 'public'))) return this.migrateRuntimePublic(created, input.runtimePath);
     return created;
   }
 
@@ -549,6 +567,17 @@ async function writeLegacyRuntimeConfig(runtimePath: string): Promise<void> {
   };
   const payload = `const defaults = require('./default/config.conf');\nmodule.exports = { ...defaults, ${JSON.stringify(overrides).slice(1, -1)} };\n`;
   await writeFile(join(runtimePath, 'config.conf'), payload, { encoding: 'utf8', mode: 0o600 });
+}
+
+/**
+ * Whether this directory holds somebody's SillyTavern data, as opposed to
+ * SillyTavern itself. See LEGACY_DATA_NAMES.
+ */
+async function holdsUserData(path: string): Promise<boolean> {
+  for (const name of LEGACY_DATA_NAMES) {
+    if (await exists(join(path, name))) return true;
+  }
+  return false;
 }
 
 async function exists(path: string): Promise<boolean> {

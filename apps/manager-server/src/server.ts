@@ -5,9 +5,9 @@ import { createReadStream } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { createSocket } from 'node:dgram';
 import { extname, join, relative, resolve, sep } from 'node:path';
-import { applyQuery, backupSearchText, backupSortValue, installationSearchText, installationSortValue, pageInfo, parseTableQuery, snapshotSearchText, snapshotSortValue, logEvent, logLineText, type ApiErrorBody, type ConfigUpdateInput, type HealthResponse, type Installation, type Job, type JobState, type LogEntry, type LogEvent, type LogLine, type LogSink, type LogSourceFilter, type ManagerPorts, type PortSettings, type Profile, type ProfileLayout, type SetupStatus, type VersionSelector } from '../../../packages/contracts/src/index.js';
+import { applyQuery, backupSearchText, backupSortValue, installationSearchText, installationSortValue, pageInfo, parseTableQuery, snapshotSearchText, snapshotSortValue, logEvent, logLineText, type ApiErrorBody, type ConfigUpdateInput, type HealthResponse, type Installation, type Job, type JobState, type LogEntry, type LogEvent, type LogLine, type LogSink, type LogSourceFilter, type ManagerPorts, type PortSettings, type Profile, type ProfileLayout, type SetupStatus, type StartupSettings, type TunnelState, type VersionSelector } from '../../../packages/contracts/src/index.js';
 import { getPlatformPaths, storageDurability, type PlatformPaths } from '../../../packages/platform/src/index.js';
-import { RuntimeError, RuntimeManager, type InstallationProgress } from '../../../packages/sillytavern-runtime/src/index.js';
+import { INSTALL_CANCELED, RuntimeError, RuntimeManager, type InstallationProgress } from '../../../packages/sillytavern-runtime/src/index.js';
 import { hashPassword, MIN_PASSWORD_LENGTH, validatePasscode, validatePassword, verifyPassword } from './password.js';
 import { RateLimiter } from './rate-limit.js';
 import { parseSessionCookie, SessionStore, clearSessionCookie, sessionCookie } from './sessions.js';
@@ -23,7 +23,7 @@ import { TunnelManager } from '../../../packages/tunnel/src/index.js';
 import { ProfileError, ProfileStore } from '../../../packages/profiles/src/index.js';
 import { BackupError, BackupStore } from '../../../packages/backup/src/index.js';
 import { CloudflareConnection, R2Error, R2Manager, type R2UpdateInput } from '../../../packages/r2/src/index.js';
-import { CloudflareApiError, CloudflareOAuthError, CloudflareRateLimitError, DEFAULT_SCOPES } from '../../../packages/cloudflare/src/index.js';
+import { CloudflareApiError, CloudflareOAuthError, CloudflareRateLimitError, DEFAULT_SCOPES, PROXY_WORKER_TARGETS, ProxyWorkerManager, type ProxyWorkerTarget } from '../../../packages/cloudflare/src/index.js';
 import { BackupScheduler, syncProfileToR2 } from './r2-scheduler.js';
 import { fetchSnapshotToLibrary, recoverProfileFromR2 } from './r2-restore.js';
 import { TransferMeter } from './progress.js';
@@ -84,6 +84,7 @@ const PROTECTED_PATHS = new Set([
   '/api/v1/metrics',
   '/api/v1/system',
   '/api/v1/system/measure',
+  '/api/v1/startup',
   '/api/v1/tunnel',
   '/api/v1/manager-tunnel',
   '/api/v1/r2',
@@ -117,6 +118,14 @@ export interface ManagerServerOptions {
   readonly r2?: R2Manager;
   /** Null turns signing in to Cloudflare off; absent builds it from the environment. */
   readonly cloudflare?: CloudflareConnection | null;
+  /**
+   * The Workers that give the tunnels a fixed address.
+   *
+   * Absent builds one from the Cloudflare sign-in, which is the only way it
+   * happens outside a test: a test that wants the console to know its own
+   * fixed address should not have to hold an OAuth grant to say so.
+   */
+  readonly proxy?: ProxyWorkerManager | null;
   readonly metrics?: MetricsStore;
   readonly config?: ConfigStore;
   readonly telemetry?: TelemetryTransport;
@@ -217,6 +226,73 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
   const backups = options.backupStore ?? new BackupStore({ paths, logger: (line) => { jobs.append('backup', line); baseLogger(line); } });
   const cloudflare = options.cloudflare !== undefined ? options.cloudflare : cloudflareConnectionFromEnvironment(paths, env);
   const r2 = options.r2 ?? new R2Manager({ paths, env, ...(cloudflare ? { cloudflare } : {}), logger: (line) => { jobs.append('backup', line); baseLogger(line); } });
+  /*
+   * The fixed addresses in front of the tunnels, when there is a Cloudflare
+   * account to put them in.
+   *
+   * A Quick Tunnel's hostname is random and different every time cloudflared
+   * starts, so the address somebody was given yesterday is gone today - and
+   * gone as `DNS_PROBE_FINISHED_NXDOMAIN`, because the name is no longer in
+   * DNS at all. A Worker on the account's own `workers.dev` subdomain has a
+   * name that does not move, and is redeployed at whatever the current tunnel
+   * is. Null when nobody has signed in to Cloudflare: there is then nowhere to
+   * put one, and the tunnel address is the only address there is.
+   */
+  /**
+   * The console's own fixed address, as a plain string.
+   *
+   * Kept here rather than asked of `proxy` where it is needed: `publicOrigins`
+   * is answered inside a request and cannot wait on a file read, and this
+   * changes about as often as somebody signs in to Cloudflare.
+   */
+  let managerProxyOrigin: string | null = null;
+  const proxy = options.proxy !== undefined ? options.proxy : (cloudflare
+    ? new ProxyWorkerManager({
+      api: cloudflare.cloudflareApi(),
+      stateDirectory: paths.state,
+      logger: (message, params) => logger(logEvent('cloudflare.proxyPublished', message, params)),
+    })
+    : null);
+  /**
+   * Point one of those Workers at the address a tunnel has just announced.
+   *
+   * Everything about this is best effort. Publishing is a write to somebody
+   * else's Cloudflare account over a network that fails, and the tunnel works
+   * perfectly well without it - so a failure is written down and the tunnel's
+   * own address goes on being the address. It is also why nothing awaits this:
+   * a deploy takes seconds, and the switch that started the tunnel must not
+   * wait for one.
+   */
+  const followTunnel = async (target: ProxyWorkerTarget, url: string | null, options: { readonly create?: boolean } = {}): Promise<void> => {
+    if (!proxy || !cloudflare) return;
+    const account = await cloudflare.workersAccount();
+    if (!account) return;
+    // Nothing to keep pointing anywhere: no tunnel now, none before, and no
+    // reason given to make one. `create` is what a fresh sign-in passes, so
+    // the reader is given their permanent address before they first use it.
+    if (url === null && !options.create && await proxy.urlFor(target) === null) return;
+    try {
+      const record = await proxy.publish(account.id, target, url);
+      if (target === 'manager') managerProxyOrigin = record.url;
+    } catch (error: unknown) {
+      logger(logEvent('cloudflare.proxyFailed', `[cloudflare] the fixed address for ${target === 'manager' ? 'the console' : 'SillyTavern'} could not be updated: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' }));
+    }
+  };
+  /**
+   * Make sure both fixed addresses exist and point where they should.
+   *
+   * Called when a Cloudflare account has just been connected, which is the
+   * moment the manager first has somewhere to put them - and the moment to
+   * tell the reader what their two permanent addresses are, whether or not
+   * either tunnel happens to be on yet.
+   */
+  const publishProxies = (): void => {
+    void followTunnel('sillyTavern', tunnel.getState().url, { create: true });
+    void followTunnel('manager', managerTunnel.getState().url, { create: true });
+  };
+  // What was deployed the last time this manager ran, so its own address is
+  // known before the tunnel has come back and asked for a redeploy.
+  void proxy?.urlFor('manager').then((url) => { managerProxyOrigin = url; }).catch(() => undefined);
   const metrics = options.metrics ?? new MetricsStore(paths);
   const config = options.config ?? new ConfigStore({ managedPort: () => sillyTavernPort, logger: (line) => { jobs.append('manager', line); baseLogger(line); } });
   // Where the console binds, which is also which addresses its ports have to be
@@ -322,6 +398,7 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
     paths,
     env,
     targetUrl: `http://127.0.0.1:${accessPort}`,
+    onUrl: (url) => { void followTunnel('sillyTavern', url); },
     beforeStart: async () => {
       if (!gateway.getState().passwordConfigured) throw new Error('Set the SillyTavern password before opening a public tunnel');
       if (gateway.getState().status !== 'running') await gateway.start();
@@ -349,6 +426,7 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
     // Read at start rather than now: an ephemeral port is not known until the
     // listener has taken one.
     targetUrl: () => `http://127.0.0.1:${boundPort}`,
+    onUrl: (url) => { void followTunnel('manager', url); },
     beforeStart: async () => {
       if ((await store.getPersisted()).adminPasswordHash === null) {
         throw new Error('Set the manager password before opening the console to the internet');
@@ -407,6 +485,21 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
     const tunnelUrl = managerTunnel.getState().url?.replace(/\/$/u, '');
     const ordered = [
       ...(environmentOrigin?.source === 'configured' ? [environmentOrigin.origin] : []),
+      /*
+       * The Worker in front of the tunnel, ahead of the tunnel itself.
+       *
+       * Ahead, because it is the address that does not change, so it is the
+       * one a sign-in should come back to and the one worth being in a link.
+       * Named at all, because a browser at the Worker's address sends that as
+       * its `Origin` while `Host` by then is the tunnel's random hostname:
+       * without this the console refuses its own sign-in form, and the address
+       * opens, shows the page, and cannot be used.
+       *
+       * Only while the tunnel is up. With nothing behind it the Worker answers
+       * every request with its own "not open right now" page, so calling it an
+       * address the console can be reached at would be untrue.
+       */
+      ...(tunnelUrl && managerProxyOrigin ? [managerProxyOrigin] : []),
       ...(tunnelUrl ? [tunnelUrl] : []),
       ...(environmentOrigin?.source === 'platform' ? [environmentOrigin.origin] : []),
     ];
@@ -454,7 +547,19 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
     }
   }
   gateway.setTargetPort(sillyTavernPort);
-  const testRuntime = process.env.NODE_ENV === 'test' || process.argv.includes('--test') || process.execArgv.includes('--test');
+  /*
+   * Whether this process is a test.
+   *
+   * `NODE_TEST_CONTEXT` is the reliable half: Node's test runner gives each
+   * file a child process, and that child sees neither `--test` in its own
+   * argv nor `NODE_ENV=test` - so the three checks that were here answered
+   * "no" in every test that mattered. The others stay for a suite run some
+   * other way.
+   */
+  const testRuntime = process.env.NODE_TEST_CONTEXT !== undefined
+    || process.env.NODE_ENV === 'test'
+    || process.argv.includes('--test')
+    || process.execArgv.includes('--test');
   const telemetryEndpoint = env.STM_TELEMETRY_ENDPOINT ?? (testRuntime ? undefined : DEFAULT_TELEMETRY_ENDPOINT);
   const telemetryEnrollmentEndpoint = env.STM_TELEMETRY_ENROLLMENT_ENDPOINT ?? (testRuntime ? undefined : DEFAULT_TELEMETRY_ENROLLMENT_ENDPOINT);
   const telemetry = options.telemetry ?? new TelemetryTransport({
@@ -488,6 +593,14 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
     logger(logEvent('setup.passwordBootstrapped', '[setup] admin password bootstrapped from STM_ADMIN_PASSWORD'));
   }
   const shutdownToken = env.STM_SHUTDOWN_TOKEN?.trim() || null;
+  /*
+   * Whether a manager with its password just set installs SillyTavern itself.
+   *
+   * Not under the test runner, where a password is set dozens of times and a
+   * Git fetch against the real network is nobody's intention, and not for
+   * anyone who asks for it to be left alone.
+   */
+  const autoInstall = !testRuntime && env.STM_AUTO_INSTALL !== '0';
   const startedAt = Date.now();
   const server = createServer((request, response) => {
     void handleRequest({
@@ -523,7 +636,10 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
       metrics,
       config,
       system,
+      proxy,
+      publishProxies,
       shutdownToken,
+      autoInstall,
       onShutdownRequest: options.onShutdownRequest,
     }).catch((error: unknown) => {
       if (error instanceof RequestError) {
@@ -586,6 +702,11 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
   void managerTunnel.resume().catch((error: unknown) => logger(logEvent('cloudflared.resumeFailed', `[cloudflared] the console's tunnel could not be restored: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' })));
   const activeInstallation = await runtime.getActiveInstallation();
   if (activeInstallation?.status === 'ready') {
+    // There is one, however it got here, so the manager has no first install
+    // left to do. Claiming it now is what stops an upgrade of the manager from
+    // deciding, on a machine set up long before this existed, that nothing has
+    // been installed yet.
+    await store.claimFirstInstall();
     let readyInstallation = activeInstallation;
     try {
       readyInstallation = await runtime.migrateLegacyInstallation?.(activeInstallation) ?? activeInstallation;
@@ -594,7 +715,7 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
       // Before the config is written and before SillyTavern is started, so what
       // comes back is what gets configured and started rather than something
       // laid over a profile already in use.
-      if (activeProfile) await recoverEmptyProfile(activeProfile, r2, backups, jobs);
+      if (activeProfile) await recoverEmptyProfile(() => Promise.resolve(activeProfile), r2, backups, jobs);
       // Reading it first turns a missing config into the handled error below
       // rather than a fault during startup.
       const currentConfig = activeProfile ? await config.read(activeProfile, readyInstallation) : null;
@@ -603,7 +724,26 @@ export async function startManagerServer(options: ManagerServerOptions = {}): Pr
     } catch (error: unknown) {
       logger(logEvent('installer.legacyMigrationFailed', `[installer] legacy runtime migration failed: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' }));
     }
-    void supervisor.start().catch((error: unknown) => logger(logEvent('sillytavern.autoStartFailed', `[sillytavern] automatic startup failed: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' })));
+    // Started with the manager unless somebody has said not to. Off is for
+    // whoever runs SillyTavern themselves, or opens the console only to look
+    // at backups on a machine they do not want a second process on.
+    if (persisted.autoStartSillyTavern) {
+      void supervisor.start().catch((error: unknown) => logger(logEvent('sillytavern.autoStartFailed', `[sillytavern] automatic startup failed: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' })));
+    } else {
+      logger(logEvent('sillytavern.autoStartOff', '[sillytavern] not started: starting it with the manager is switched off'));
+    }
+  } else {
+    /*
+     * Nothing installed, and a bucket set up in `.env` that already holds data.
+     *
+     * This is the machine that starts from nothing every time. It cannot be
+     * given its profile back yet - a profile is made against an installation,
+     * and there is not one - but it can say, before anybody wonders, that the
+     * data is not lost and that installing is what brings it back. Said in the
+     * log rather than made into a question: the settings are in `.env` because
+     * somebody put them there, which is the decision already taken.
+     */
+    void announceRecoverable(r2, logger);
   }
 
   return {
@@ -653,10 +793,21 @@ async function handleRequest(options: {
   readonly metrics: MetricsStore;
   readonly config: ConfigStore;
   readonly system: SystemStore;
+  readonly proxy: ProxyWorkerManager | null;
+  /** Put the fixed addresses in place, for a Cloudflare account just connected. */
+  readonly publishProxies: () => void;
   readonly shutdownToken: string | null;
+  /**
+   * Whether the manager may install SillyTavern by itself on a first run.
+   *
+   * Off under the test runner and for anyone who sets `STM_AUTO_INSTALL=0`:
+   * the install is a Git fetch and an `npm install` against the real network,
+   * which is not something a test that sets a password has asked for.
+   */
+  readonly autoInstall: boolean;
   readonly onShutdownRequest: (() => void) | undefined;
 }): Promise<void> {
-  const { request, response, store, sessions, rateLimiter, startedAt, publicOrigins, ports, staticRoot, platform, runtime, jobs, supervisor, tunnel, managerTunnel, gateway, profiles, backups, r2, cloudflare, metrics, config, system, shutdownToken, onShutdownRequest } = options;
+  const { request, response, store, sessions, rateLimiter, startedAt, publicOrigins, ports, staticRoot, platform, logger, runtime, jobs, supervisor, tunnel, managerTunnel, gateway, profiles, backups, r2, cloudflare, metrics, config, system, proxy, publishProxies, shutdownToken, autoInstall, onShutdownRequest } = options;
   // Whether the browser's side of this connection is HTTPS, which is not the
   // same question as whether ours is: a hosted console is reached over HTTPS
   // that a proxy terminates before us, and only the proxy's own header says so.
@@ -731,7 +882,30 @@ async function handleRequest(options: {
   }
 
   if (pathname === '/api/v1/setup/password' && method === 'POST') {
-    await handlePasswordSetup(context, store, sessions, rateLimiter, secureCookies);
+    await handlePasswordSetup(context, store, sessions, rateLimiter, secureCookies, async () => {
+      /*
+       * A manager that has just been set up has nothing installed, and one
+       * obvious next step.
+       *
+       * Making the reader find and press Install is asking them to confirm the
+       * only thing this program does. It runs once per installation of the
+       * manager - claimed under the state file's own write queue - so somebody
+       * who later removes SillyTavern on purpose does not find it putting
+       * itself back. The console follows the job it produces the same way it
+       * follows one somebody pressed for, and can stop it.
+       */
+      if (!autoInstall) return;
+      if ((await runtime.listInstallations()).length > 0) return;
+      if (!await store.claimFirstInstall()) return;
+      try {
+        await beginInstallation({ runtime, jobs, supervisor, profiles, backups, r2, system }, 'latest');
+        logger(logEvent('installer.firstRun', '[installer] installing SillyTavern, because this manager has just been set up and has none'));
+      } catch (error: unknown) {
+        // Nothing is owed here: the console shows Install, and the reader can
+        // press it. A first run must not fail over this.
+        logger(logEvent('installer.firstRunFailed', `[installer] the first installation could not be started: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' }));
+      }
+    });
     return;
   }
 
@@ -770,14 +944,14 @@ async function handleRequest(options: {
     if (method !== 'GET' && !requireCsrf(context, session.csrfToken)) {
       return;
     }
-    await handleRuntimeRequest(context, store, runtime, jobs, supervisor, tunnel, managerTunnel, gateway, profiles, backups, r2, cloudflare, metrics, config, system);
+    await handleRuntimeRequest(context, store, runtime, jobs, supervisor, tunnel, managerTunnel, gateway, profiles, backups, r2, cloudflare, metrics, config, system, proxy, publishProxies, logger);
     return;
   }
 
   sendError(response, 404, 'not_found', 'Route not found');
 }
 
-async function handleRuntimeRequest(context: RequestContext, store: StateStore, runtime: RuntimeManager, jobs: JobStore, supervisor: ProcessSupervisor, tunnel: TunnelManager, managerTunnel: TunnelManager, gateway: AccessGateway, profiles: ProfileStore, backups: BackupStore, r2: R2Manager, cloudflare: CloudflareConnection | null, metrics: MetricsStore, config: ConfigStore, system: SystemStore): Promise<void> {
+async function handleRuntimeRequest(context: RequestContext, store: StateStore, runtime: RuntimeManager, jobs: JobStore, supervisor: ProcessSupervisor, tunnel: TunnelManager, managerTunnel: TunnelManager, gateway: AccessGateway, profiles: ProfileStore, backups: BackupStore, r2: R2Manager, cloudflare: CloudflareConnection | null, metrics: MetricsStore, config: ConfigStore, system: SystemStore, proxy: ProxyWorkerManager | null, publishProxies: () => void, logger: LogSink): Promise<void> {
   const { pathname, ports, request, response, searchParams } = context;
   const method = request.method ?? 'GET';
   if (pathname === '/api/v1/auth/password' && method === 'POST') {
@@ -1003,11 +1177,14 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
     return;
   }
   if (pathname.startsWith('/api/v1/r2/cloudflare')) {
-    await handleCloudflareRequest(context, cloudflare, r2);
+    await handleCloudflareRequest(context, cloudflare, r2, proxy, publishProxies, logger);
     return;
   }
-  if (pathname === '/api/v1/r2/test' && method === 'POST') {
-    sendJson(response, 200, await r2.testConnection());
+  // The one question about the bucket: is it reachable, and what is in it. It
+  // replaced three buttons that each answered part of it and then said so in a
+  // notification that went away.
+  if (pathname === '/api/v1/r2/check' && method === 'POST') {
+    sendJson(response, 200, { check: await r2.inspect(), config: await r2.getConfig() });
     return;
   }
   if (pathname === '/api/v1/r2/objects' && method === 'GET') {
@@ -1023,9 +1200,24 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
     return;
   }
   if (pathname === '/api/v1/r2/snapshots' && method === 'GET') {
+    /*
+     * Every recovery point in the bucket, not this profile's.
+     *
+     * A profile identifier is made on the machine that made the profile, so a
+     * machine that has just been set up - a hosted one that starts empty, a new
+     * computer, a reinstall - has an identifier the bucket has never seen. Asking
+     * for its own points came back with none, and the panel said the bucket was
+     * empty over a bucket holding a year of them. The one moment somebody most
+     * needs to see what is there is the moment they have just connected, and it
+     * was the one moment this showed nothing.
+     *
+     * The chunks are shared across every profile in the bucket, so a point from
+     * another one costs no more to bring back and restores the same way. Which
+     * profile each belongs to comes back with it, for the panel to say so.
+     */
     const profile = await profiles.getActive();
-    const snapshots = profile ? await r2.listSnapshots(profile.id) : [];
-    sendList(response, 'snapshots', snapshots, searchParams, { searchText: snapshotSearchText, sortValue: snapshotSortValue });
+    const snapshots = await r2.listSnapshots().catch(() => []);
+    sendList(response, 'snapshots', snapshots, searchParams, { searchText: snapshotSearchText, sortValue: snapshotSortValue }, { activeProfileId: profile?.id ?? null });
     return;
   }
   const snapshotMatch = /^\/api\/v1\/r2\/snapshots\/([^/]+)\/fetch$/u.exec(pathname);
@@ -1033,6 +1225,11 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
     const profile = await profiles.getActive();
     if (!profile) { sendError(response, 409, 'profile_required', 'Create or activate a profile before fetching a recovery point'); return; }
     const snapshotId = snapshotMatch[1] ?? '';
+    // Which profile in the bucket it belongs to, when that is not this one.
+    // Sent by the panel from the row it was pressed on; a point of this
+    // profile's own needs nothing and says nothing.
+    const fetchBody = await readJson(request);
+    const sourceProfileId = isRecord(fetchBody) && typeof fetchBody.profileId === 'string' && fetchBody.profileId ? fetchBody.profileId : profile.id;
     // Fetching lands it in the backup library rather than writing it straight
     // into the profile. Restoring is then the path that already exists, with
     // its preview, its safety snapshot and its merge-or-replace choice.
@@ -1040,14 +1237,16 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
     const { job, signal } = jobs.createOperation('backup', logEvent('job.fetchingRecoveryPoint', 'Fetching the recovery point from R2'));
     const meter = new TransferMeter();
     void fetchSnapshotToLibrary({
-      profile, r2, backups, snapshotId, signal,
+      profile, r2, backups, snapshotId, sourceProfileId, signal,
       logger: (line) => jobs.append('backup', line),
       onProgress: (progress) => {
         const { percent, params } = meter.update(progress);
         jobs.updateOperation(job.id, percent, logEvent('job.fetchingChunks', `Fetching ${String(params.done)} of ${String(params.total)} - ${String(params.rate)}, ${String(params.eta)} left`, params));
       },
     })
-      .then(() => jobs.finishOperation(job.id, 'succeeded', null))
+      // The archive it landed as, so the panel can offer to put it back rather
+      // than leaving the reader to find it in the library themselves.
+      .then(({ manifest }) => jobs.finishOperation(job.id, 'succeeded', null, { backupId: manifest.id }))
       .catch((error: unknown) => jobs.finishOperation(job.id, 'failed', error instanceof Error ? error.message : 'The recovery point could not be fetched'));
     sendJson(response, 202, { jobId: job.id, job });
     return;
@@ -1123,7 +1322,7 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
     const [installations, active] = await Promise.all([runtime.listInstallations(), runtime.getActiveInstallation()]);
     // The active pointer travels with the page: it names a row that may not be
     // on it, and the panel needs it to mark the row wherever it turns up.
-    sendList(response, 'installations', installations, searchParams, { searchText: installationSearchText, sortValue: installationSortValue }, { activeInstallationId: active?.id ?? null });
+    sendList(response, 'installations', installations, searchParams, { searchText: installationSearchText, sortValue: installationSortValue }, { activeInstallationId: active?.id ?? null, activeJob: jobs.activeInstallation() });
     return;
   }
   if (pathname === '/api/v1/installations' && method === 'DELETE') {
@@ -1144,60 +1343,13 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
       sendError(response, 400, 'invalid_version', 'A valid SillyTavern version must be selected');
       return;
     }
-    const previousProfile = await profiles.getActive();
-    let queuedId = '';
-    let queued: { id: string; promise: Promise<Installation> };
     try {
-      /*
-       * Stopping SillyTavern and copying the profile happen inside the job,
-       * not inside this request.
-       *
-       * They used to run before the response was written, so a 202 meaning
-       * "accepted, watch the progress" did not arrive until a full copy of the
-       * profile had been written to disk - minutes, on a large one, with the
-       * panel holding its confirmation dialog open and nothing on screen
-       * saying a backup was being taken. The order of the work is unchanged;
-       * only the reply no longer waits for it.
-       */
-      queued = runtime.queueInstall(
-        selector as VersionSelector,
-        (progress) => jobs.updateFromProgress(queuedId, progress),
-        async (report) => {
-          await supervisor.stop('install');
-          if (!previousProfile) return;
-          await report(4, logEvent('install.safetyCopy', 'Copying your data before switching version'));
-          await backups.createSafetyCopy(previousProfile, { kind: 'before-switch' });
-        },
-      );
+      const started = await beginInstallation({ runtime, jobs, supervisor, profiles, backups, r2, system }, selector as VersionSelector);
+      sendJson(response, 202, { installationId: started.installationId, job: started.job });
     } catch (error: unknown) {
-      await supervisor.start();
       if (error instanceof RuntimeError) { sendError(response, 409, error.code, error.message); return; }
       throw error;
     }
-    queuedId = queued.id;
-    const job = jobs.create(queued.id);
-    void queued.promise.then(async (installation) => {
-      jobs.finish(queued.id, installation.status === 'ready' ? 'succeeded' : 'failed', installation.error);
-      if (installation.status === 'ready') {
-        if (previousProfile) await profiles.rebind(previousProfile.id, installation.id, installation.runtimePath);
-        else {
-          // A first install on a machine that starts empty every time. If the
-          // bucket holds what this machine used to have, it goes back now,
-          // before SillyTavern is started on an empty profile.
-          await recoverEmptyProfile(await profiles.ensureDefault({ installationId: installation.id, runtimePath: installation.runtimePath }), r2, backups, jobs);
-        }
-        await runtime.cleanupLegacyRuntimeCopies?.(installation.id);
-      }
-      await supervisor.start();
-    }).catch(async (error: unknown) => {
-      jobs.finish(queued.id, 'failed', error instanceof Error ? error.message : 'Installation failed');
-      // Putting SillyTavern back is best effort: this path only runs because
-      // something already failed, and a second failure inside it rejected with
-      // nobody listening - which ends the manager process and takes the console
-      // down with it, leaving no way to install a different version.
-      await supervisor.start().catch(() => supervisor.getState());
-    });
-    sendJson(response, 202, { installationId: queued.id, job });
     return;
   }
   if (pathname === '/api/v1/profiles' && method === 'GET') {
@@ -1414,15 +1566,38 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
   // version switch instead of being replaced by a different random one.
   if (pathname === '/api/v1/process/stop' && method === 'POST') { sendJson(response, 200, await supervisor.stop('requested')); return; }
   if (pathname === '/api/v1/process/restart' && method === 'POST') { sendJson(response, 200, await supervisor.restart()); return; }
-  if (pathname === '/api/v1/tunnel' && method === 'GET') { sendJson(response, 200, tunnel.getState()); return; }
+  /*
+   * The tunnel, and the fixed address in front of it.
+   *
+   * The Worker's address is added here rather than kept by the tunnel manager,
+   * which knows nothing about Cloudflare accounts and should not. The panel
+   * shows the fixed one and keeps the tunnel's own beside it, because that is
+   * where the traffic really goes and it is worth being able to see.
+   */
+  if (pathname === '/api/v1/tunnel' && method === 'GET') { sendJson(response, 200, await withProxyUrl(tunnel.getState(), proxy, 'sillyTavern')); return; }
   if (pathname === '/api/v1/tunnel' && method === 'PUT') {
     const body = await readJson(request);
     const mode = isRecord(body) && (body.mode === 'off' || body.mode === 'quick' || body.mode === 'named') ? body.mode : null;
     if (!mode) { sendError(response, 400, 'invalid_tunnel_mode', 'Tunnel mode must be off, quick, or named'); return; }
-    if (mode !== 'off' && supervisor.getState().status !== 'running') { sendError(response, 409, 'sillytavern_not_running', 'Start SillyTavern before enabling the tunnel'); return; }
+    /*
+     * SillyTavern does not have to be running, or installed.
+     *
+     * What the tunnel publishes is the access gateway, which is up from the
+     * moment the manager is - the comment above `/process/stop` says so, and it
+     * is why a public address survives a stop, a restart and a version switch.
+     * Refusing to open it until SillyTavern answers contradicted that: it made
+     * the address depend on the one thing it was built not to depend on, and
+     * left somebody setting a machine up unable to do the two steps in the
+     * order that suits them. Opened early, the gateway answers that SillyTavern
+     * is not there yet, and starts serving it the moment it is.
+     *
+     * The PIN is a different matter and still required: it is what stands
+     * between the internet and the data, and there is no sense in which it can
+     * wait.
+     */
     if (mode !== 'off' && !gateway.getState().passwordConfigured) { sendError(response, 409, 'public_access_password_required', 'Set the SillyTavern password before opening a public tunnel'); return; }
     const state = mode === 'off' ? await tunnel.disable() : await tunnel.start(mode, isRecord(body) && typeof body.token === 'string' ? body.token : undefined);
-    sendJson(response, 200, state);
+    sendJson(response, 200, await withProxyUrl(state, proxy, 'sillyTavern'));
     return;
   }
   /**
@@ -1435,7 +1610,7 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
    * platform's own address does not work, which is a problem the console has
    * whether or not anything is installed yet.
    */
-  if (pathname === '/api/v1/manager-tunnel' && method === 'GET') { sendJson(response, 200, managerTunnel.getState()); return; }
+  if (pathname === '/api/v1/manager-tunnel' && method === 'GET') { sendJson(response, 200, await withProxyUrl(managerTunnel.getState(), proxy, 'manager')); return; }
   if (pathname === '/api/v1/manager-tunnel' && method === 'PUT') {
     const body = await readJson(request);
     const mode = isRecord(body) && (body.mode === 'off' || body.mode === 'quick' || body.mode === 'named') ? body.mode : null;
@@ -1448,7 +1623,30 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
       return;
     }
     const state = mode === 'off' ? await managerTunnel.disable() : await managerTunnel.start(mode, isRecord(body) && typeof body.token === 'string' ? body.token : undefined);
-    sendJson(response, 200, state);
+    sendJson(response, 200, await withProxyUrl(state, proxy, 'manager'));
+    return;
+  }
+  /*
+   * What the manager does with SillyTavern when it starts.
+   *
+   * One switch, in its own route rather than folded into SillyTavern's own
+   * settings: those are written into the runtime's config.yaml and belong to
+   * the version installed, and this one belongs to the manager and outlives
+   * every version it installs.
+   */
+  if (pathname === '/api/v1/startup' && method === 'GET') {
+    const state = await store.getPersisted();
+    sendJson(response, 200, { startup: { autoStartSillyTavern: state.autoStartSillyTavern } satisfies StartupSettings });
+    return;
+  }
+  if (pathname === '/api/v1/startup' && method === 'PUT') {
+    const body = await readJson(request);
+    if (!isRecord(body) || typeof body.autoStartSillyTavern !== 'boolean') {
+      sendError(response, 400, 'invalid_input', 'autoStartSillyTavern must be true or false');
+      return;
+    }
+    await store.setAutoStartSillyTavern(body.autoStartSillyTavern);
+    sendJson(response, 200, { startup: { autoStartSillyTavern: body.autoStartSillyTavern } satisfies StartupSettings });
     return;
   }
   if (pathname === '/api/v1/system' && method === 'GET') {
@@ -1484,6 +1682,121 @@ async function handleRuntimeRequest(context: RequestContext, store: StateStore, 
     return;
   }
   sendError(response, 404, 'not_found', 'Route not found');
+}
+
+/**
+ * A tunnel's state with the fixed address in front of it attached.
+ *
+ * Null rather than absent when there is no Worker, so a panel can tell "no
+ * fixed address" from "this manager does not know about them".
+ */
+async function withProxyUrl(state: TunnelState, proxy: ProxyWorkerManager | null, target: ProxyWorkerTarget): Promise<TunnelState> {
+  return { ...state, proxyUrl: proxy ? await proxy.urlFor(target).catch(() => null) : null };
+}
+
+/** What starting an installation needs, whoever asked for it. */
+interface InstallationDeps {
+  readonly runtime: RuntimeManager;
+  readonly jobs: JobStore;
+  readonly supervisor: ProcessSupervisor;
+  readonly profiles: ProfileStore;
+  readonly backups: BackupStore;
+  readonly r2: R2Manager;
+  readonly system: SystemStore;
+}
+
+/**
+ * Queue an installation and everything that has to happen around one.
+ *
+ * Its own function because there are two ways in now: somebody pressing
+ * Install, and a manager that has just had its password set and has nothing
+ * installed at all. Both need the same safety copy, the same rebinding, the
+ * same recovery of an empty profile out of the bucket, and the same restart
+ * afterwards - and a second copy of that would be a second chance to get one
+ * of them wrong.
+ *
+ * Throws RuntimeError when an installation is already in flight; the caller
+ * decides what that means for its own answer.
+ */
+async function beginInstallation(deps: InstallationDeps, selector: VersionSelector): Promise<{ installationId: string; job: Job }> {
+  const { runtime, jobs, supervisor, profiles, backups, r2, system } = deps;
+  const previousProfile = await profiles.getActive();
+  const previousInstallation = await runtime.getActiveInstallation();
+  let queuedId = '';
+  let queued: { id: string; promise: Promise<Installation> };
+  // Made here rather than by the job registry, because the work has to be
+  // handed the signal at the moment it is queued and the job is named after
+  // the installation the queue hands back.
+  const stopping = new AbortController();
+  try {
+    /*
+     * Stopping SillyTavern and copying the profile happen inside the job,
+     * not inside this request.
+     *
+     * They used to run before the response was written, so a 202 meaning
+     * "accepted, watch the progress" did not arrive until a full copy of the
+     * profile had been written to disk - minutes, on a large one, with the
+     * panel holding its confirmation dialog open and nothing on screen
+     * saying a backup was being taken. The order of the work is unchanged;
+     * only the reply no longer waits for it.
+     */
+    queued = runtime.queueInstall(
+      selector,
+      (progress) => jobs.updateFromProgress(queuedId, progress),
+      async (report) => {
+        await supervisor.stop('install');
+        if (!previousProfile) return;
+        await report(4, logEvent('install.safetyCopy', 'Copying your data before switching version'));
+        await backups.createSafetyCopy(previousProfile, { kind: 'before-switch' });
+      },
+      stopping.signal,
+    );
+  } catch (error: unknown) {
+    await supervisor.start().catch(() => supervisor.getState());
+    throw error;
+  }
+  queuedId = queued.id;
+  const job = jobs.create(queued.id, stopping);
+  void queued.promise.then(async (installation) => {
+    jobs.finish(queued.id, installation.status === 'ready' ? 'succeeded' : 'failed', installation.error);
+    /*
+     * Stopped, and put back the way it was found.
+     *
+     * The runtime has already taken out whatever this attempt wrote. What is
+     * left is not to go on as if it had finished: no rebinding, no profile
+     * recovered into an installation that does not exist, and SillyTavern
+     * started again only when there was one before this to start.
+     */
+    if (installation.errorCode === INSTALL_CANCELED) {
+      if (previousInstallation) await supervisor.start().catch(() => supervisor.getState());
+      return;
+    }
+    if (installation.status === 'ready') {
+      if (previousProfile) await profiles.rebind(previousProfile.id, installation.id, installation.runtimePath);
+      else {
+        // A first install on a machine that starts empty every time. If the
+        // bucket holds what this machine used to have, it goes back now,
+        // before SillyTavern is started on an empty profile.
+        // The profile is made inside, so the slot is held before it exists
+        // and the scheduler cannot find it half-restored.
+        await recoverEmptyProfile(() => profiles.ensureDefault({ installationId: installation.id, runtimePath: installation.runtimePath }), r2, backups, jobs);
+      }
+      await runtime.cleanupLegacyRuntimeCopies?.(installation.id);
+      // There is a profile now where a moment ago there was none, and on the
+      // overview its size is the line somebody who has just installed is
+      // watching. Walked now rather than on whatever poll next falls due.
+      system.remeasure();
+    }
+    await supervisor.start();
+  }).catch(async (error: unknown) => {
+    jobs.finish(queued.id, 'failed', error instanceof Error ? error.message : 'Installation failed');
+    // Putting SillyTavern back is best effort: this path only runs because
+    // something already failed, and a second failure inside it rejected with
+    // nobody listening - which ends the manager process and takes the console
+    // down with it, leaving no way to install a different version.
+    await supervisor.start().catch(() => supervisor.getState());
+  });
+  return { installationId: queued.id, job };
 }
 
 /** Each apply-phase step gets its own percentage so a slow phase still shows the bar moving. */
@@ -1625,7 +1938,7 @@ function cloudflareConnectionFromEnvironment(paths: PlatformPaths, env: NodeJS.P
  * the signed-in bucket the one backed up to, and disconnecting it switches R2
  * backups off rather than leaving them failing on a schedule.
  */
-async function handleCloudflareRequest(context: RequestContext, cloudflare: CloudflareConnection | null, r2: R2Manager): Promise<void> {
+async function handleCloudflareRequest(context: RequestContext, cloudflare: CloudflareConnection | null, r2: R2Manager, proxy: ProxyWorkerManager | null, publishProxies: () => void, logger: LogSink): Promise<void> {
   const { pathname, request, response } = context;
   const method = request.method ?? 'GET';
   if (!cloudflare) { sendError(response, 404, 'cloudflare_not_available', 'This manager has no Cloudflare sign-in configured'); return; }
@@ -1663,12 +1976,38 @@ async function handleCloudflareRequest(context: RequestContext, cloudflare: Clou
     const accountId = isRecord(body) && typeof body.accountId === 'string' ? body.accountId : '';
     if (!/^[0-9a-f]{32}$/u.test(accountId)) { sendError(response, 400, 'invalid_account', 'A Cloudflare account ID is required'); return; }
     const status = await cloudflare.chooseAccount(accountId, await r2.keysBucket());
-    if (status.state === 'connected') await r2.update({ mode: 'cloudflare', enabled: true });
+    if (status.state === 'connected') {
+      await r2.update({ mode: 'cloudflare', enabled: true });
+      // There is somewhere to put the fixed addresses now. Not waited for: a
+      // deploy takes seconds and the reader is waiting to see their account
+      // connected, not to see two Workers appear.
+      publishProxies();
+    }
     sendJson(response, 200, { cloudflare: status, config: await r2.getConfig() });
     return;
   }
   if (pathname === '/api/v1/r2/cloudflare/disconnect' && method === 'POST') {
+    /*
+     * The Workers go before the grant does, because afterwards there is no
+     * grant to remove them with.
+     *
+     * Signing out has to leave nothing of ours behind in somebody's account -
+     * a Worker nobody can explain, still answering on their own subdomain, is
+     * the worst thing to find there. Best effort all the same: a removal that
+     * fails must not stop the sign-out the reader asked for, and the Worker
+     * that is left is one they can delete in the dashboard.
+     */
+    const account = proxy ? await cloudflare.workersAccount().catch(() => null) : null;
+    if (proxy && account) {
+      for (const target of PROXY_WORKER_TARGETS) {
+        await proxy.remove(account.id, target).catch((error: unknown) => {
+          logger(logEvent('cloudflare.proxyRemoveFailed', `[cloudflare] a fixed address Worker could not be removed: ${error instanceof Error ? error.message : 'unknown error'}`, { reason: error instanceof Error ? error.message : 'unknown error' }));
+          return false;
+        });
+      }
+    }
     const result = await cloudflare.disconnect();
+    await proxy?.forget().catch(() => undefined);
     if ((await r2.getConfig()).mode === 'cloudflare') await r2.update({ enabled: false });
     sendJson(response, 200, { ...result, config: await r2.getConfig() });
     return;
@@ -1835,6 +2174,8 @@ async function handlePasswordSetup(
   sessions: SessionStore,
   rateLimiter: RateLimiter,
   secureCookies: boolean,
+  /** Run once the password is saved, after the answer is on its way back. */
+  afterSetup?: () => Promise<void>,
 ): Promise<void> {
   if (!checkRateLimit(context, rateLimiter)) {
     return;
@@ -1872,6 +2213,9 @@ async function handlePasswordSetup(
   context.response.setHeader('Set-Cookie', sessionCookie(created.token, secureCookies));
   const session = created.session;
   sendJson(context.response, 201, { ok: true, setupRequired: false, session });
+  // After the answer, not before it: what follows takes minutes, and the
+  // reader is waiting to be let into the console.
+  if (afterSetup) await afterSetup().catch(() => undefined);
 }
 
 async function handleLogin(
@@ -2152,17 +2496,61 @@ async function settlePort(options: SettlePortOptions): Promise<number> {
  * not running yet at either call site, and a safety copy of an empty profile is
  * a slow way to archive nothing.
  */
-async function recoverEmptyProfile(profile: Profile, r2: R2Manager, backups: BackupStore, jobs: JobStore): Promise<void> {
-  const config = await r2.getConfig();
-  // Nowhere to recover from. On a machine that is wiped between runs this is
-  // the case where the R2 settings went with everything else, which is why the
-  // ones that survive - from the environment - are the ones that matter here.
-  if (!config.enabled || !config.configured) return;
-  await recoverProfileFromR2({
-    profile, r2, backups,
-    logger: (line) => jobs.append('backup', line),
-    restore: async (archivePath) => { await backups.restore(profile, archivePath, { mode: 'replace' }); },
-  });
+/**
+ * Say that the bucket holds data this machine has not got, before it is asked.
+ *
+ * Costs one listing, and only on a start with nothing installed, which is the
+ * one start where it answers a question somebody is about to have.
+ */
+async function announceRecoverable(r2: R2Manager, logger: LogSink): Promise<void> {
+  try {
+    const config = await r2.getConfig();
+    if (!config.enabled || !config.configured) return;
+    const snapshots = await r2.listSnapshots();
+    const newest = snapshots[0];
+    if (!newest) return;
+    logger(logEvent('r2.awaitingInstall', `[r2] the bucket holds ${snapshots.length} recovery point(s), the newest from ${newest.createdAt}; installing SillyTavern brings the newest one back automatically`, { count: snapshots.length, createdAt: newest.createdAt }));
+  } catch {
+    // A bucket that cannot be reached on the way up is not worth a line here:
+    // the console is about to be open, and it says so there.
+  }
+}
+
+async function recoverEmptyProfile(settle: () => Promise<Profile>, r2: R2Manager, backups: BackupStore, jobs: JobStore): Promise<void> {
+  /*
+   * The backup slot is held from before the profile exists.
+   *
+   * Bringing a profile back takes a minute or two of downloading, and the
+   * scheduler ticks every minute. Without this it woke up in the middle of one,
+   * found a profile holding the four files that had arrived so far, and wrote
+   * that to the bucket as a recovery point - which is then the newest one
+   * there, and the one the next wiped machine would be given back. A backup of
+   * a profile caught mid-restore is worse than no backup: it is the shape of
+   * the reader's data with nothing in it.
+   *
+   * Reserved rather than queued: the restore inside this takes the slot itself,
+   * and waiting for a slot this already holds would wait forever.
+   */
+  const release = backups.reserve();
+  try {
+    const profile = await settle();
+    const config = await r2.getConfig();
+    // Nowhere to recover from. On a machine that is wiped between runs this is
+    // the case where the R2 settings went with everything else, which is why the
+    // ones that survive - from the environment - are the ones that matter here.
+    if (!config.enabled || !config.configured) return;
+    const restored = await recoverProfileFromR2({
+      profile, r2, backups,
+      logger: (line) => jobs.append('backup', line),
+      restore: async (archivePath) => { await backups.restore(profile, archivePath, { mode: 'replace' }); },
+    });
+    // Nobody was watching while this ran. The card says it happened, and says it
+    // of the recovery point rather than of the archive that carried it here:
+    // when the data was taken is what the reader is trying to work out.
+    if (restored) await r2.recordRecovery({ createdAt: restored.point.createdAt, fileCount: restored.manifest.fileCount, sizeBytes: restored.manifest.sizeBytes });
+  } finally {
+    release();
+  }
 }
 
 function listen(server: Server, host: string, port: number): Promise<void> {
@@ -2287,7 +2675,16 @@ class JobStore {
     return this.logBuffer.readBefore(before, source, limit);
   }
 
-  public create(installationId: string): Job {
+  /**
+   * An installation job, and the controller that stops it.
+   *
+   * A first install is a Git fetch, an `npm install` and a start of
+   * SillyTavern - minutes, and a good deal more than that on a phone. It used
+   * to be the one long job in this manager with no way out of it: a restore or
+   * an upload could be stopped, and the thing somebody is most likely to have
+   * started by mistake could not.
+   */
+  public create(installationId: string, controller?: AbortController): Job {
     const now = new Date().toISOString();
     const job: Job = {
       id: `job-${installationId}`,
@@ -2302,6 +2699,7 @@ class JobStore {
       error: null,
     };
     this.jobs.set(job.id, job);
+    if (controller) this.controllers.set(job.id, controller);
     return job;
   }
 
@@ -2354,6 +2752,18 @@ class JobStore {
    * must not look like nothing is happening - the operator would start it
    * again on top of the one already running.
    */
+  /**
+   * The installation that is running, for a panel that did not start it.
+   *
+   * A reloaded page, or one that came back to a manager which installed
+   * SillyTavern by itself on first run: both need the job to follow, and to
+   * stop it if they want to.
+   */
+  public activeInstallation(): Job | null {
+    for (const job of this.jobs.values()) if (job.state === 'running' && job.kind === 'installation') return job;
+    return null;
+  }
+
   public activeOperation(): Job | null {
     let newest: Job | null = null;
     for (const job of this.jobs.values()) {
@@ -2374,7 +2784,18 @@ class JobStore {
     const id = `job-${installationId}`;
     const current = this.jobs.get(id);
     if (!current) return;
-    this.jobs.set(id, { ...current, state, progress: state === 'succeeded' ? 100 : current.progress, step: state === 'succeeded' ? 'Installation ready' : 'Installation failed', stepCode: state === 'succeeded' ? 'install.ready' : 'install.failed', error, updatedAt: new Date().toISOString() });
+    // Asked for, so it is not a failure and carries no error to explain.
+    const settled: JobState = state === 'failed' && this.wasCanceled(id) ? 'canceled' : state;
+    this.controllers.delete(id);
+    this.jobs.set(id, {
+      ...current,
+      state: settled,
+      progress: settled === 'succeeded' ? 100 : current.progress,
+      step: settled === 'succeeded' ? 'Installation ready' : settled === 'canceled' ? 'Installation stopped' : 'Installation failed',
+      stepCode: settled === 'succeeded' ? 'install.ready' : settled === 'canceled' ? 'install.canceled' : 'install.failed',
+      error: settled === 'canceled' ? null : error,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   public updateOperation(id: string, progress: number, step: LogEvent): void {
@@ -2383,15 +2804,18 @@ class JobStore {
     this.jobs.set(id, { ...current, progress: Math.max(0, Math.min(100, Math.round(progress))), step: step.message, stepCode: step.code, ...(step.params ? { stepParams: step.params } : {}), updatedAt: new Date().toISOString() });
   }
 
-  /** `evenIfCanceled` keeps a failure that happened after a stop reported as one. */
-  public finishOperation(id: string, state: 'succeeded' | 'failed', error: string | null, options: { readonly evenIfCanceled?: boolean; readonly stepCode?: string | undefined } = {}): void {
+  /**
+   * `evenIfCanceled` keeps a failure that happened after a stop reported as one.
+   * `backupId` names an archive the job produced, for a panel that has to act on it.
+   */
+  public finishOperation(id: string, state: 'succeeded' | 'failed', error: string | null, options: { readonly evenIfCanceled?: boolean; readonly stepCode?: string | undefined; readonly backupId?: string | undefined } = {}): void {
     const current = this.jobs.get(id);
     if (!current) return;
     const settled: JobState = state === 'failed' && this.wasCanceled(id) && !options.evenIfCanceled ? 'canceled' : state;
     const step = settled === 'succeeded' ? 'Completed' : settled === 'canceled' ? 'Stopped' : 'Failed';
     const stepCode = options.stepCode ?? (settled === 'succeeded' ? 'job.completed' : settled === 'canceled' ? 'job.stopped' : 'job.failed');
     this.controllers.delete(id);
-    this.jobs.set(id, { ...current, state: settled, progress: settled === 'succeeded' ? 100 : current.progress, step, stepCode, error: settled === 'canceled' ? null : error, updatedAt: new Date().toISOString() });
+    this.jobs.set(id, { ...current, state: settled, progress: settled === 'succeeded' ? 100 : current.progress, step, stepCode, ...(options.backupId ? { resultBackupId: options.backupId } : {}), error: settled === 'canceled' ? null : error, updatedAt: new Date().toISOString() });
   }
 }
 

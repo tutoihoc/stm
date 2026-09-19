@@ -28,10 +28,10 @@ import { failures, logCatalog, translator, type Fail, type Translate } from './i
 import { browserEnvironment, browserStorage, readPreferences, savePreferences, type LocaleCode, type Preferences } from './preferences.js';
 import { authErrorKey } from './auth-error.js';
 import { DEFAULT_SILLYTAVERN_PORT, portRefusal } from './ports.js';
-import { readTunnelOfferDeclined, saveTunnelOfferDeclined, shouldOfferManagerTunnel } from './hosting.js';
+import { isThisMachine, readTunnelOfferDeclined, saveTunnelOfferDeclined, shouldOfferManagerTunnel } from './hosting.js';
 import { availableUpdate, readDismissedUpdate, saveDismissedUpdate } from './updates.js';
 import { apiFetch, onSessionExpired, resetSessionWatch } from './session.js';
-import type { AccessGatewayState, BackupManifest, ConfigDocument, ConfigSettings, ConfigSettingsInput, ConfigUpdateInput, Installation, Job, LocalBackupSchedule, LogEntry, LogSourceFilter, MetricsBucket, MetricsSnapshot, PortSettings, ProcessState, Profile, R2CloudflareUsage, R2Config, R2SnapshotSummary, R2UsageResponse, R2UsageWarning, RestoreMode, RestorePreview, StorageDurabilityReport, SystemSnapshot, TunnelState, VersionOption } from '../../../packages/contracts/src/index.js';
+import type { AccessGatewayState, BackupManifest, ConfigDocument, ConfigSettings, ConfigSettingsInput, ConfigUpdateInput, Installation, Job, LocalBackupSchedule, LogEntry, LogSourceFilter, MetricsBucket, MetricsSnapshot, PortSettings, ProcessState, Profile, R2CheckResult, R2CloudflareUsage, R2Config, R2ConnectionMode, R2SnapshotSummary, R2UsageResponse, R2UsageWarning, RestoreMode, RestorePreview, StartupSettings, StorageDurabilityReport, SystemSnapshot, TunnelState, VersionOption } from '../../../packages/contracts/src/index.js';
 import { BACKUP_KINDS, backupKind, backupSearchText, backupSortValue, formatBytes, type BackupKind, metricsSearchText, metricsSortValue, snapshotSortValue } from '../../../packages/contracts/src/index.js';
 import { useLiveLogs } from './use-live-logs.js';
 import { translateLogEntry, translateStep } from './log-format.js';
@@ -386,6 +386,10 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
   const [backups, setBackups] = useState<BackupManifest[]>([]);
   const [installing, setInstalling] = useState(false);
   const [pendingInstallationId, setPendingInstallationId] = useState<string | null>(null);
+  /** The job behind the install in flight, which is what stopping it asks for. */
+  const [installJobId, setInstallJobId] = useState<string | null>(null);
+  /** What the manager does with SillyTavern on its own way up. Null until read. */
+  const [startup, setStartup] = useState<StartupSettings | null>(null);
   const [logSource, setLogSource] = useState<LogSourceFilter>('all');
   const [logQuery, setLogQuery] = useState('');
   const [logsExpanded, setLogsExpanded] = useState(false);
@@ -486,13 +490,31 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
     let cancelled = false;
     void Promise.all([
       apiFetch('/api/v1/versions', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ versions: VersionOption[] }> : null),
-      apiFetch('/api/v1/installations', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ installations: Installation[]; activeInstallationId: string | null }> : null),
+      apiFetch('/api/v1/installations', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ installations: Installation[]; activeInstallationId: string | null; activeJob: Job | null }> : null),
       apiFetch('/api/v1/profiles', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ profiles: Profile[]; activeProfileId: string | null }> : null),
       apiFetch('/api/v1/backups', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ backups: BackupManifest[] }> : null),
-    ]).then(([versionPayload, installationPayload, profilePayload, backupPayload]) => {
+      apiFetch('/api/v1/startup', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ startup: StartupSettings }> : null),
+    ]).then(([versionPayload, installationPayload, profilePayload, backupPayload, startupPayload]) => {
       if (cancelled) return;
+      if (startupPayload) setStartup(startupPayload.startup);
       if (versionPayload) setVersions(versionPayload.versions);
-      if (installationPayload) { setInstallations(installationPayload.installations); setActiveInstallationId(installationPayload.activeInstallationId); }
+      if (installationPayload) {
+        setInstallations(installationPayload.installations);
+        setActiveInstallationId(installationPayload.activeInstallationId);
+        /*
+         * An install already running that this page did not start.
+         *
+         * Two ways that happens: the page was reloaded during one, and a
+         * manager that had just been set up installed SillyTavern by itself.
+         * Adopting it is what makes the progress on the card belong to
+         * something - and gives the reader the button that stops it.
+         */
+        if (installationPayload.activeJob) {
+          setInstalling(true);
+          setPendingInstallationId(installationPayload.activeJob.installationId);
+          setInstallJobId(installationPayload.activeJob.id);
+        }
+      }
       if (profilePayload) { setProfiles(profilePayload.profiles); setActiveProfileId(profilePayload.activeProfileId); }
       if (backupPayload) setBackups(backupPayload.backups);
     }).catch(() => undefined);
@@ -536,11 +558,31 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
     if (!installing) return undefined;
     if (!pendingInstallationId) return undefined;
     const timer = window.setInterval(() => {
-      void apiFetch(`/api/v1/installations/${pendingInstallationId}`, { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<Installation> : null).then((installation) => {
+      void apiFetch(`/api/v1/installations/${pendingInstallationId}`, { credentials: 'same-origin' }).then(async (response) => {
+        // A stopped install takes its own record away with everything else it
+        // wrote, so the row this was watching is simply not there any more.
+        // Without this the console sat on "Installing" for as long as it was
+        // left open, over a machine on which nothing was being installed.
+        if (response.status === 404) return 'gone' as const;
+        return response.ok ? await response.json() as Installation : null;
+      }).then((installation) => {
+        if (installation === 'gone') {
+          setInstalling(false);
+          setPendingInstallationId(null);
+          setInstallJobId(null);
+          setInstallations((current) => current.filter((item) => item.id !== pendingInstallationId));
+          void apiFetch('/api/v1/installations', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ installations: Installation[]; activeInstallationId: string | null }> : null).then((payload) => {
+            if (!payload) return;
+            setInstallations(payload.installations);
+            setActiveInstallationId(payload.activeInstallationId);
+          }).catch(() => undefined);
+          return;
+        }
         if (!installation) return;
         setInstallations((current) => [...current.filter((item) => item.id !== installation.id), installation]);
         if (installation.status === 'ready' || installation.status === 'failed') {
           setInstalling(false);
+          setInstallJobId(null);
           // Keep the pending id so the just-finished result stays visible.
           // Refresh the active pointer after the runtime switches atomically.
           void apiFetch('/api/v1/installations', { credentials: 'same-origin' }).then(async (response) => response.ok ? response.json() as Promise<{ installations: Installation[]; activeInstallationId: string | null }> : null).then((payload) => {
@@ -553,6 +595,27 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
     }, 1200);
     return () => window.clearInterval(timer);
   }, [installing, pendingInstallationId]);
+
+  /**
+   * Stop the install that is running, and let the server take back what it wrote.
+   *
+   * The answer is not waited for here beyond the request being accepted: what
+   * happens next is the same polling that was already watching the install,
+   * which sees the record go and clears the card.
+   */
+  const cancelInstall = async (): Promise<void> => {
+    if (!installJobId || !csrfToken) return;
+    await apiFetch(`/api/v1/jobs/${encodeURIComponent(installJobId)}/cancel`, { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrfToken } }).catch(() => undefined);
+  };
+
+  /** Whether SillyTavern comes up with the manager. Reported back so the switch can go back. */
+  const setAutoStartSillyTavern = async (enabled: boolean): Promise<string | null> => {
+    const response = await apiFetch('/api/v1/startup', { method: 'PUT', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ autoStartSillyTavern: enabled }) });
+    const payload = await response.json() as { startup?: StartupSettings; error?: { message?: string } };
+    if (!response.ok || !payload.startup) return fail.body(payload, t('console.startupSaveFailed'));
+    setStartup(payload.startup);
+    return null;
+  };
 
   const navigate: Navigate = (next) => { window.location.hash = next; setPage(next); window.scrollTo({ top: 0 }); };
   const changePreferences = onPreferencesChange;
@@ -737,6 +800,8 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
     networkHost={configDocument?.networkHost ?? null}
     installed={Boolean(activeInstallationId)}
     installing={installing}
+    canCancelInstall={installJobId !== null}
+    onCancelInstall={cancelInstall}
     active={activeInstallation}
     dataBytes={systemSnapshot?.storage.dataBytes ?? null}
     profileName={profiles.find((profile) => profile.id === activeProfileId)?.name ?? null}
@@ -746,10 +811,12 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
     onPendingInstallationId={setPendingInstallationId}
     csrfToken={csrfToken}
     onInstalling={setInstalling}
+    onInstallJob={setInstallJobId}
     onRemove={removeInstallation}
     onStart={() => updateRuntime('/api/v1/process/start')}
     onStop={() => updateRuntime('/api/v1/process/stop')}
     onSetPassword={setAccessPassword}
+    onPublish={() => updateRuntime('/api/v1/tunnel', { mode: 'quick' })}
     onShowAddresses={() => { document.querySelector('[data-tour="remote-access"]')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }}
     onOpenSettings={() => navigate('config')}
   />;
@@ -782,7 +849,7 @@ function ConsoleApp({ csrfToken, preferences, onPreferencesChange, onSignOut }: 
             </div>
           </header>
           <PageContainer>
-            {page === 'overview' ? <div className="grid min-w-0 gap-(--section-gap)">{hero}<AccessPanel t={t} process={processState} tunnel={tunnelState} config={configDocument} security={accessSecurity} sillyTavernPort={sillyTavernPort} installed={Boolean(activeInstallationId)} onAction={updateRuntime} onSetLan={setAccessLan} onSetPassword={setAccessPassword} /><CardGrid columns={2}><DataPanel t={t} navigate={navigate} latestBackup={backups.at(-1) ?? null} snapshot={systemSnapshot} onRemeasure={remeasure} /><SystemPanel t={t} snapshot={systemSnapshot} />{logs}</CardGrid></div> : page === 'data' ? <DataPage t={t} locale={preferences.locale} fail={fail} catalog={catalog} csrfToken={csrfToken} profiles={profiles} activeProfileId={activeProfileId} backups={backups} onProfilesChange={(next, active) => { setProfiles(next); setActiveProfileId(active); }} onBackupsChange={setBackups} /> : page === 'metrics' ? <MetricsPage t={t} /> : page === 'config' ? <ConfigPage t={t} locale={preferences.locale} config={configDocument} security={accessSecurity} ports={portSettings} managerTunnel={managerTunnelState} onSetManagerTunnel={setManagerTunnel} onPortChange={updateSillyTavernPort} onConfigUpdate={updateConfig} onConfigReset={resetConfig} process={processState} catalog={catalog} onChangeManagerPassword={changeManagerPassword} onSetPassword={setAccessPassword} onSignOut={onSignOut} onSignOutDevices={signOutAccessDevices} /> : <ResourcePanel page={page} t={t} />}
+            {page === 'overview' ? <div className="grid min-w-0 gap-(--section-gap)">{hero}<AccessPanel t={t} process={processState} tunnel={tunnelState} config={configDocument} security={accessSecurity} sillyTavernPort={sillyTavernPort} onAction={updateRuntime} onSetLan={setAccessLan} onSetPassword={setAccessPassword} /><CardGrid columns={2}><DataPanel t={t} navigate={navigate} latestBackup={backups.at(-1) ?? null} snapshot={systemSnapshot} onRemeasure={remeasure} /><SystemPanel t={t} snapshot={systemSnapshot} />{logs}</CardGrid></div> : page === 'data' ? <DataPage t={t} locale={preferences.locale} fail={fail} catalog={catalog} csrfToken={csrfToken} profiles={profiles} activeProfileId={activeProfileId} backups={backups} onProfilesChange={(next, active) => { setProfiles(next); setActiveProfileId(active); }} onBackupsChange={setBackups} /> : page === 'metrics' ? <MetricsPage t={t} /> : page === 'config' ? <ConfigPage t={t} locale={preferences.locale} config={configDocument} security={accessSecurity} ports={portSettings} managerTunnel={managerTunnelState} onSetManagerTunnel={setManagerTunnel} startup={startup} onSetAutoStart={setAutoStartSillyTavern} onPortChange={updateSillyTavernPort} onConfigUpdate={updateConfig} onConfigReset={resetConfig} process={processState} catalog={catalog} onChangeManagerPassword={changeManagerPassword} onSetPassword={setAccessPassword} onSignOut={onSignOut} onSignOutDevices={signOutAccessDevices} /> : <ResourcePanel page={page} t={t} />}
           </PageContainer>
           <MobileNav
             items={navigation.map(({ id, icon }) => ({ id, icon, href: `#${id}`, label: t(`nav.${id}`) }))}
@@ -829,8 +896,8 @@ function ManagerTunnelOffer({ t, open, hostname, tunnel, onDecline, onAccept }: 
       </DialogHeader>
       <DialogBody className="grid gap-3">
         <p className="text-sm text-muted-foreground">{t('console.tunnelOfferNote')}</p>
-        {tunnel.url
-          ? <code className="break-all rounded-lg border bg-muted/40 p-3 font-mono text-sm">{tunnel.url}</code>
+        {tunnel.proxyUrl ?? tunnel.url
+          ? <code className="break-all rounded-lg border bg-muted/40 p-3 font-mono text-sm">{tunnel.proxyUrl ?? tunnel.url}</code>
           : tunnel.mode !== 'off'
             ? <div className="grid gap-2 rounded-lg border bg-muted/40 p-3" role="status"><span className="thinking">{t('console.tunnelOfferOpening')}</span><TaskBar /></div>
             : null}
@@ -838,8 +905,8 @@ function ManagerTunnelOffer({ t, open, hostname, tunnel, onDecline, onAccept }: 
       </DialogBody>
       <DialogFooter>
         <Button variant="outline" onClick={onDecline}>{tunnel.url ? t('common.close') : t('console.tunnelOfferDecline')}</Button>
-        {tunnel.url
-          ? <Button asChild><a href={tunnel.url} target="_blank" rel="noopener noreferrer"><ArrowUpRight />{t('console.tunnelOfferOpen')}</a></Button>
+        {tunnel.proxyUrl ?? tunnel.url
+          ? <Button asChild><a href={(tunnel.proxyUrl ?? tunnel.url)!} target="_blank" rel="noopener noreferrer"><ArrowUpRight />{t('console.tunnelOfferOpen')}</a></Button>
           : <Button disabled={busy || tunnel.mode !== 'off'} onClick={() => void accept()}>{busy ? <LoaderCircle className="animate-spin" /> : null}{t('console.tunnelOfferAccept')}</Button>}
       </DialogFooter>
     </DialogContent>
@@ -1053,23 +1120,35 @@ function Unavailable({ t, children }: { t: Translate; children: ReactNode }) {
  */
 function RuntimeCard({
   t, fail, catalog, process, tunnel, security, sillyTavernPort, networkHost, installed, installing, active, dataBytes, profileName,
-  version, onVersionChange, versions, onPendingInstallationId, csrfToken, onInstalling, onRemove,
-  onStart, onStop, onSetPassword, onShowAddresses, onOpenSettings,
+  version, onVersionChange, versions, onPendingInstallationId, csrfToken, onInstalling, onInstallJob, onRemove,
+  canCancelInstall, onCancelInstall,
+  onStart, onStop, onSetPassword, onPublish, onShowAddresses, onOpenSettings,
 }: {
   t: Translate; fail: Fail; catalog: Record<string, unknown>; process: ProcessState; tunnel: TunnelState;
   security: AccessGatewayState; sillyTavernPort: number; networkHost: string | null; installed: boolean; installing: boolean;
   active: Installation | undefined; dataBytes: number | null; profileName: string | null; version: string;
   onVersionChange: (value: string) => void; versions: VersionOption[];
   onPendingInstallationId: (value: string | null) => void; csrfToken: string | null;
-  onInstalling: (value: boolean) => void; onRemove: () => Promise<string | null>;
+  onInstalling: (value: boolean) => void; onInstallJob: (value: string | null) => void; onRemove: () => Promise<string | null>;
+  /** Whether the install in flight is one the server will take back. */
+  canCancelInstall: boolean;
+  onCancelInstall: () => Promise<void>;
   onStart: () => Promise<void>; onStop: () => Promise<void>;
   onSetPassword: (password: string, confirmPassword: string) => Promise<string | null>;
+  /** Turn the tunnel on, for a reader who has no address that reaches this machine. */
+  onPublish: () => Promise<void>;
   onShowAddresses: () => void;
   onOpenSettings: () => void;
 }) {
   const [stopAsked, setStopAsked] = useState(false);
+  // Asked for on the way to a link, not before: the PIN is what the tunnel
+  // needs, and it means something at the moment the door is about to open.
+  const [passcodeAsked, setPasscodeAsked] = useState(false);
+  const [publishing, setPublishing] = useState(false);
   const [askedVersion, setAskedVersion] = useState<string | null>(null);
   const [askedRemove, setAskedRemove] = useState(false);
+  const [askedStopInstall, setAskedStopInstall] = useState(false);
+  const [stoppingInstall, setStoppingInstall] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [embedOpen, setEmbedOpen] = useState(false);
@@ -1148,16 +1227,22 @@ function RuntimeCard({
     onInstalling(true);
     try {
       const response = await apiFetch('/api/v1/installations', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ version }) });
-      const payload = await response.json() as { installationId?: string; error?: { message?: string } };
+      const payload = await response.json() as { installationId?: string; job?: { id?: string }; error?: { message?: string } };
       if (!response.ok) { report(fail.body(payload, t('console.installRequestFailed'))); onInstalling(false); return; }
       if (!payload.installationId) { report(t('console.installRequestFailed')); onInstalling(false); return; }
       onPendingInstallationId(payload.installationId);
+      // The job, not the installation: stopping is asked of the job, and the
+      // record the installation lives in is one of the things a stop removes.
+      onInstallJob(payload.job?.id ?? null);
     } catch { report(t('console.installRequestFailed')); onInstalling(false); }
   };
 
   // The first install has nothing to interrupt. Every one after it replaces a
   // working copy and restarts it, which is worth a question.
   const requestInstall = () => { if (installed || running) setAskedVersion(version); else void install(); };
+  // Asked about, because what is being given up is however many minutes of
+  // downloading have already been spent.
+  const stopInstall = () => { setAskedStopInstall(true); };
   const takeUpdate = () => { if (update) { onVersionChange('latest'); setAskedVersion('latest'); } };
   const dismissUpdate = () => {
     if (!update) return;
@@ -1174,11 +1259,17 @@ function RuntimeCard({
    * and says instead that this console may frame it - so the embed needs the
    * gateway up, and the gateway needs its PIN set before it lets anyone past.
    *
-   * Only from this machine. Reached over the network the console is on some
-   * other origin, which the gateway has not been told to allow, and the frame
-   * would come up blank with nothing on screen to explain why.
+   * Only from this machine, and that is not a gap waiting to be filled.
+   * Reached over the network the console is on some other origin, which the
+   * gateway has not been told to allow; and reached through the two Workers
+   * the console and the gateway are two different hostnames, so the session
+   * cookie the embed relies on would be a third-party cookie inside a
+   * cross-site frame - blocked outright by Safari and Firefox, and by Chrome
+   * before long. A feature that works in one browser and fails silently in
+   * the rest is worse than the tab this falls back to, which works in all of
+   * them. The box below says so by offering that instead.
    */
-  const onThisMachine = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost';
+  const onThisMachine = isThisMachine(window.location.hostname);
   const embedUrl = `http://${window.location.hostname}:${security.port}/`;
   const canEmbed = running && onThisMachine;
   // A frame kept loaded across a stop would come back to an error page.
@@ -1205,11 +1296,34 @@ function RuntimeCard({
     } catch { report(t('console.embedFailed')); } finally { setEmbedOpening(false); }
   };
 
-  const addresses = reachableAddresses(tunnel, security, networkHost ?? window.location.hostname, sillyTavernPort);
-  // There is always at least the loopback address.
-  const primary = addresses[0]!;
-  const otherCount = addresses.length - 1;
-  const openPrimary = () => { window.open(primary.url, '_blank', 'noopener,noreferrer'); };
+  const addresses = reachableAddresses(tunnel, security, networkHost ?? window.location.hostname, sillyTavernPort, onThisMachine);
+  /*
+   * The best address there is, or none at all.
+   *
+   * None is what a hosted console has before anything is published: the
+   * loopback address belongs to a container nobody can reach, the network
+   * address is off, and there is no tunnel yet. This used to fall back on the
+   * loopback address and offer it as the way in, which from the reader's
+   * browser is their own machine - a link that opens a connection refused.
+   */
+  const primary = addresses[0] ?? null;
+  const otherCount = Math.max(0, addresses.length - 1);
+  const openPrimary = () => { if (primary) window.open(primary.url, '_blank', 'noopener,noreferrer'); };
+  /*
+   * Give the reader a link to SillyTavern, doing whatever that takes.
+   *
+   * The tunnel publishes the gateway, and the gateway will not open without a
+   * PIN, so those are the two steps - asked for here, in that order, off one
+   * press. Telling somebody on a hosted studio that their only address is one
+   * they cannot use, and leaving them to find the switch, is how a console
+   * ends up looking broken.
+   */
+  const publish = async () => {
+    if (!security.passwordConfigured) { setPasscodeAsked(true); return; }
+    setPublishing(true);
+    try { await onPublish(); } finally { setPublishing(false); }
+  };
+  const waitingForLink = running && primary === null;
 
   return <>
     <Card className="runtime-card" data-tour="installation">
@@ -1220,7 +1334,9 @@ function RuntimeCard({
         </h2>
         <CardAction className="runtime-actions">
           {installed ? <>
-            <Button variant="outline" size="sm" disabled={!running} onClick={openPrimary}><ArrowUpRight />{t('console.openInTab')}</Button>
+            {waitingForLink
+              ? <Button variant="outline" size="sm" onClick={() => void publish()} disabled={publishing || tunnel.mode !== 'off'}><Globe2 />{publishing || tunnel.mode !== 'off' ? t('common.loading') : t('console.getLink')}</Button>
+              : <Button variant="outline" size="sm" disabled={!running || primary === null} onClick={openPrimary}><ArrowUpRight />{t('console.openInTab')}</Button>}
             {running
               ? <Button variant="destructive" size="sm" onClick={() => setStopAsked(true)} disabled={pending}><Square />{t('dashboard.stop')}</Button>
               : <Button size="sm" onClick={() => void run(onStart)} disabled={pending || installingNow}><Play />{pending ? t('common.loading') : t('dashboard.start')}</Button>}
@@ -1245,7 +1361,12 @@ function RuntimeCard({
               <span className="runtime-preview-cta"><Monitor aria-hidden="true" />{embedOpening ? t('common.loading') : embedMounted ? t('console.embedResume') : t('console.useItHere')}</span>
               <span className="runtime-preview-note">{embedMounted ? t('console.embedResumeHint') : t('console.useItHereHint')}</span>
             </button>
-            : running
+            : waitingForLink
+              ? <button type="button" className="runtime-preview-open" onClick={() => void publish()} disabled={publishing || tunnel.mode !== 'off'}>
+                <span className="runtime-preview-cta"><Globe2 aria-hidden="true" />{publishing || tunnel.mode !== 'off' ? t('console.linkStarting') : t('console.getLink')}</span>
+                <span className="runtime-preview-note">{t('console.getLinkHint')}</span>
+              </button>
+              : running
               ? <button type="button" className="runtime-preview-open" onClick={openPrimary}>
                 <span className="runtime-preview-cta"><ArrowUpRight aria-hidden="true" />{t('console.useItHere')}</span>
                 <span className="runtime-preview-note">{t('console.useItInTabHint')}</span>
@@ -1262,10 +1383,12 @@ function RuntimeCard({
           {running ? <div className="runtime-row">
             <dt>{t('console.addressLabel')}</dt>
             <dd>
-              <AddressLink t={t} href={primary.url}>
-                <span className="address-full">{primary.host}</span>
-                <span className="address-short">{shortenHost(primary.host)}</span>
-              </AddressLink>
+              {primary
+                ? <AddressLink t={t} href={primary.url}>
+                  <span className="address-full">{primary.host}</span>
+                  <span className="address-short">{shortenHost(primary.host)}</span>
+                </AddressLink>
+                : <span className="text-muted-foreground">{t('console.noAddressYet')}</span>}
               {otherCount > 0
                 ? <button type="button" className="runtime-shared" onClick={onShowAddresses}>{t('console.alsoOnline', { count: otherCount })}</button>
                 : null}
@@ -1291,8 +1414,8 @@ function RuntimeCard({
             <dt>{t('console.dataProfile')}</dt>
             <dd>
               <span>{profileName ?? t('console.noProfiles')}</span>
-              <span className="runtime-sep" aria-hidden="true">·</span>
-              {dataBytes === null ? <span className="thinking">{t('system.measuring')}</span> : <span className="runtime-bytes">{formatBytes(dataBytes)}</span>}
+              {profileName === null ? null : <span className="runtime-sep" aria-hidden="true">·</span>}
+              {profileName === null ? null : dataBytes === null ? <span className="thinking">{t('system.measuring')}</span> : <span className="runtime-bytes">{formatBytes(dataBytes)}</span>}
             </dd>
           </div>
 
@@ -1301,6 +1424,16 @@ function RuntimeCard({
             <dd className="runtime-progress">
               <TaskLine task={t('console.taskInstall')} step={translateStep(active.step, catalog, active.stepCode, active.stepParams)} percent={active.progress} />
               <TaskBar percent={active.progress} />
+              {/* A first install is minutes of Git and npm, and on a phone a
+                  good deal more. Somebody who started it by mistake, or on the
+                  wrong version, used to have nothing to press. What is stopped
+                  is taken back by the server, so the machine is left as it was
+                  found rather than holding half a checkout. */}
+              {canCancelInstall ? <div className="runtime-progress-actions">
+                <Button variant="outline" size="sm" disabled={stoppingInstall} onClick={() => void stopInstall()}>
+                  {stoppingInstall ? <LoaderCircle className="animate-spin" /> : <Square />}{stoppingInstall ? t('console.installStopping') : t('console.installStop')}
+                </Button>
+              </div> : null}
             </dd>
           </div> : removing ? <div className="runtime-row">
             <dt>{t('console.progressLabel')}</dt>
@@ -1340,7 +1473,7 @@ function RuntimeCard({
       </CardFooter> : null}
     </Card>
 
-    {embedMounted ? <EmbedStage t={t} open={embedOpen} url={embedUrl} openUrl={primary.url} onMinimize={() => setEmbedOpen(false)} onClose={() => { setEmbedOpen(false); setEmbedMounted(false); }} /> : null}
+    {embedMounted && primary ? <EmbedStage t={t} open={embedOpen} url={embedUrl} openUrl={primary.url} onMinimize={() => setEmbedOpen(false)} onClose={() => { setEmbedOpen(false); setEmbedMounted(false); }} /> : null}
 
     <ConfirmDialog
       open={stopAsked}
@@ -1361,6 +1494,29 @@ function RuntimeCard({
       cancelLabel={t('common.cancel')}
       onConfirm={install}
     />
+    <PasscodeDialog
+      t={t}
+      open={passcodeAsked}
+      onOpenChange={setPasscodeAsked}
+      note={null}
+      onSubmit={async (passcode, confirmPasscode) => {
+        const failure = await onSetPassword(passcode, confirmPasscode);
+        if (failure) return failure;
+        // The PIN was only ever the condition. Publishing is what was asked for.
+        setPublishing(true);
+        try { await onPublish(); } finally { setPublishing(false); }
+        return null;
+      }}
+    />
+    <ConfirmDialog
+      open={askedStopInstall}
+      onOpenChange={setAskedStopInstall}
+      title={t('console.installStopConfirm')}
+      description={t('console.installStopConfirmBody')}
+      confirmLabel={t('console.installStop')}
+      cancelLabel={t('common.cancel')}
+      onConfirm={async () => { setStoppingInstall(true); try { await onCancelInstall(); } finally { setStoppingInstall(false); } }}
+    />
     <ConfirmDialog
       open={askedRemove}
       onOpenChange={setAskedRemove}
@@ -1373,7 +1529,7 @@ function RuntimeCard({
   </>;
 }
 
-function AccessPanel({ t, process, tunnel, config, security, sillyTavernPort, installed, onAction, onSetLan, onSetPassword }: { t: Translate; process: ProcessState; tunnel: TunnelState; config: ConfigDocument | null; security: AccessGatewayState; sillyTavernPort: number; installed: boolean; onAction: (path: string, body?: unknown) => Promise<void>; onSetLan: (lan: boolean) => Promise<string | null>; onSetPassword: (password: string, confirmPassword: string) => Promise<string | null> }) {
+function AccessPanel({ t, process, tunnel, config, security, sillyTavernPort, onAction, onSetLan, onSetPassword }: { t: Translate; process: ProcessState; tunnel: TunnelState; config: ConfigDocument | null; security: AccessGatewayState; sillyTavernPort: number; onAction: (path: string, body?: unknown) => Promise<void>; onSetLan: (lan: boolean) => Promise<string | null>; onSetPassword: (password: string, confirmPassword: string) => Promise<string | null> }) {
   const [busy, setBusy] = useState(false);
   const [securityBusy, setSecurityBusy] = useState(false);
   const running = process.status === 'running';
@@ -1399,7 +1555,17 @@ function AccessPanel({ t, process, tunnel, config, security, sillyTavernPort, in
   const [closing, setClosing] = useState<'tunnel' | 'lan' | null>(null);
   const runAction = async (path: string, body?: unknown) => { setBusy(true); try { await onAction(path, body); } finally { setBusy(false); } };
   const setTunnel = async (on: boolean) => { await runAction('/api/v1/tunnel', { mode: on ? 'quick' : 'off' }); };
-  // What to turn on once a password exists, or null when nothing is waiting.
+  /*
+   * What to turn on once a PIN exists, or null when nothing is waiting.
+   *
+   * A switch pressed without a PIN is a request, not a state: it opens the
+   * dialog that asks for one, and it is that dialog finishing which turns the
+   * thing on. Until then the switch shows what is true, which is off - and a
+   * dialog closed without a PIN leaves it there, because nothing was turned on.
+   * These switches used to be disabled instead, with a line underneath naming a
+   * prerequisite, which left the reader to go and find the prerequisite
+   * themselves.
+   */
   const [waiting, setWaiting] = useState<'tunnel' | 'lan' | null>(null);
   const askForPassword = (what: 'tunnel' | 'lan') => { setWaiting(what); setPasswordOpen(true); };
   const toggleTunnel = (next: boolean) => {
@@ -1426,6 +1592,11 @@ function AccessPanel({ t, process, tunnel, config, security, sillyTavernPort, in
   // already a boundary. Everything else goes through the gateway and its
   // password: the LAN address and the tunnel both point there.
   const local = localHost(sillyTavernPort);
+  // Whether the reader is on the machine this is running on. From anywhere else
+  // - another device on the Wi-Fi, a hosted studio, a forwarded port - the
+  // loopback address names the reader's own computer, so it is shown as what it
+  // is rather than offered as a link into a machine it was never going to reach.
+  const onThisMachine = isThisMachine(window.location.hostname);
   const lanHost = `${config?.networkHost ?? window.location.hostname ?? 'localhost'}:${security.port}`;
   const localUrl = `http://${local}`;
   const lanUrl = `http://${lanHost}`;
@@ -1479,14 +1650,19 @@ function AccessPanel({ t, process, tunnel, config, security, sillyTavernPort, in
             <strong>{t('console.quickTunnel')}{!tunnelWanted ? <span className="access-badge"><Star />{t('console.tunnelBadge')}</span> : null}</strong>
             <span>{t('console.tunnelWhy')}</span>
           </div>
-          <Switch id="tunnel-switch" checked={tunnelWanted} onCheckedChange={toggleTunnel} disabled={busy || (tunnelWanted ? false : !installed || !running)} aria-label={t('console.enableTunnel')} />
+          {/* Not waiting on SillyTavern. The tunnel publishes the door in
+              front of it, which is up from the moment the console is, and it
+              serves SillyTavern the moment SillyTavern answers - so somebody
+              setting a machine up gets to do these steps in whichever order
+              suits them, and the address is ready before it is needed. */}
+          <Switch id="tunnel-switch" checked={tunnelWanted} onCheckedChange={toggleTunnel} disabled={busy} aria-label={t('console.enableTunnel')} />
         </div>
         <div className="access-row">
           <div>
             <strong>{t('console.lanAccess')}</strong>
             <span>{t('console.lanWhy')}</span>
           </div>
-          <Switch id="listen-switch" checked={lan} onCheckedChange={toggleLan} disabled={!installed || securityBusy} aria-label={t('console.enableLan')} />
+          <Switch id="listen-switch" checked={lan} onCheckedChange={toggleLan} disabled={securityBusy} aria-label={t('console.enableLan')} />
         </div>
       </div>
       {/* With SillyTavern down every one of these leads nowhere, so the whole
@@ -1494,9 +1670,19 @@ function AccessPanel({ t, process, tunnel, config, security, sillyTavernPort, in
       {running ? <>
         <div className="access-group-label">{t('console.addresses')}</div>
         <div className="address-rows">
-          <AddressRow t={t} label={t('dashboard.publicAddress')} url={tunnel.url} display={tunnel.url ?? ''} disabledHint={t('console.tunnelOffShort')} />
+          {/* The fixed Worker address when there is one, because that is the
+              address worth giving anybody; the tunnel's own is inside the
+              sheet, where somebody looking for it will find it. */}
+          <AddressRow
+            t={t}
+            label={t('dashboard.publicAddress')}
+            url={tunnel.proxyUrl ?? tunnel.url}
+            display={tunnel.proxyUrl ?? tunnel.url ?? ''}
+            disabledHint={t('console.tunnelOffShort')}
+            {...(tunnel.proxyUrl && tunnel.url ? { alternates: [tunnel.url] } : {})}
+          />
           <AddressRow t={t} label={t('console.lanAddress')} url={lan ? lanUrl : null} display={lanHost} disabledHint={t('console.lanOffShort')} />
-          <AddressRow t={t} label={t('console.local')} url={localUrl} display={local} />
+          <AddressRow t={t} label={t('console.local')} url={onThisMachine ? localUrl : null} display={local} disabledHint={t('console.localElsewhere')} />
         </div>
       </> : null}
       <ConfirmDialog
@@ -1684,7 +1870,7 @@ function AddressLink({ t, href, children }: { t: Translate; href: string; childr
  * the button beside it opens the sheet that holds the code, the copy and the
  * open - for that address, not for whichever one the footer had in mind.
  */
-function AddressRow({ t, label, url, display, disabledHint }: { t: Translate; label: string; url: string | null; display: string; disabledHint?: string }) {
+function AddressRow({ t, label, url, display, disabledHint, alternates }: { t: Translate; label: string; url: string | null; display: string; disabledHint?: string; alternates?: readonly string[] }) {
   const [open, setOpen] = useState(false);
   return <div className="address-row">
     <span className="address-name">{label}</span>
@@ -1699,25 +1885,21 @@ function AddressRow({ t, label, url, display, disabledHint }: { t: Translate; la
       disabled={url === null}
       onClick={() => setOpen(true)}
     ><QrCodeIcon /></Button>
-    {url ? <ShareDialog t={t} open={open} onOpenChange={setOpen} label={label} url={url} /> : null}
+    {url ? <ShareDialog t={t} open={open} onOpenChange={setOpen} label={label} links={[url, ...(alternates ?? [])]} /> : null}
   </div>;
 }
 
-/** The code, the address, and the two things anyone wants to do with it. */
-function ShareDialog({ t, open, onOpenChange, label, url }: { t: Translate; open: boolean; onOpenChange: (open: boolean) => void; label: string; url: string }) {
-  const [copied, setCopied] = useState(false);
-  const { toast } = useToast();
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      // A clipboard the browser will not hand over is not a failure worth a
-      // dialog of its own: the address is on screen and can be selected.
-      toast({ title: t('console.copyFailed'), tone: 'destructive' });
-    }
-  };
+/**
+ * The code, and every address that reaches this door.
+ *
+ * Three things and no fourth: the code, and one line per address, each of them
+ * a link. Where a place has two addresses - a Worker with a fixed name and the
+ * tunnel it forwards to - both are here, one under the other, because either
+ * works and a reader is entitled to see the second rather than be told about
+ * it. The first is the one the code carries and the one worth sharing.
+ */
+function ShareDialog({ t, open, onOpenChange, label, links }: { t: Translate; open: boolean; onOpenChange: (open: boolean) => void; label: string; links: readonly string[] }) {
+  const primary = links[0] ?? '';
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="share-dialog">
       <DialogHeader>
@@ -1725,13 +1907,11 @@ function ShareDialog({ t, open, onOpenChange, label, url }: { t: Translate; open
         <DialogDescription>{t('console.scanToOpen')}</DialogDescription>
       </DialogHeader>
       <DialogBody className="share-body">
-        <QrCode value={url} label={`${label}: ${url}`} />
-        <code className="share-url">{url}</code>
+        <QrCode value={primary} label={`${label}: ${primary}`} />
+        <div className="share-links">
+          {links.map((link) => <a key={link} className="share-url" href={link} target="_blank" rel="noopener noreferrer">{link}</a>)}
+        </div>
       </DialogBody>
-      <DialogFooter className="share-actions">
-        <Button variant="outline" onClick={() => void copy()}><Copy />{copied ? t('console.linkCopied') : t('dashboard.copyLink')}</Button>
-        <Button variant="outline" asChild><a href={url} target="_blank" rel="noopener noreferrer"><ArrowUpRight />{t('dashboard.open')}</a></Button>
-      </DialogFooter>
     </DialogContent>
   </Dialog>;
 }
@@ -1763,8 +1943,12 @@ function DataPanel({ t, navigate, latestBackup, snapshot, onRemeasure }: { t: Tr
   const storage = snapshot?.storage ?? null;
   const dataBytes = storage?.dataBytes ?? null;
   const totalBytes = storage?.managerBytes ?? null;
-  const archiveBytes = totalBytes === null || dataBytes === null ? null : Math.max(0, totalBytes - dataBytes);
-  const measured = archiveBytes !== null && dataBytes !== null;
+  // Measured, as opposed to still being walked. A machine with no profile has
+  // no `dataBytes`, which is an answer rather than an absence of one: the size
+  // is what the manager holds, and none of it is a profile yet.
+  const measured = totalBytes !== null;
+  const profileBytes = dataBytes ?? 0;
+  const otherBytes = totalBytes === null ? 0 : Math.max(0, totalBytes - profileBytes);
   return <Card data-tour="data" className="overview-pair">
     <PanelHeading icon={<Database />}>{t('console.dataAndBackups')}</PanelHeading>
     <CardContent className="flex-1">
@@ -1772,9 +1956,9 @@ function DataPanel({ t, navigate, latestBackup, snapshot, onRemeasure }: { t: Tr
         <DetailRow label={t('console.sizeLabel')}>
           {measured
             ? <span className="size-split">
-              <span>{formatBytes(archiveBytes)} <em>({t('console.sizeBackups')})</em></span>
+              <span>{formatBytes(otherBytes)} <em>({t('console.sizeBackups')})</em></span>
               <span aria-hidden="true">+</span>
-              <span>{formatBytes(dataBytes)} <em>({t('console.sizeData')})</em></span>
+              <span>{formatBytes(profileBytes)} <em>({t('console.sizeData')})</em></span>
             </span>
             : <span className="thinking">{t('system.measuring')}</span>}
         </DetailRow>
@@ -1968,6 +2152,21 @@ export function backupDisplayName(t: Translate, locale: string, backup: BackupMa
   return `${t(BACKUP_KIND_LABEL[backupKind(backup)])} · ${when}`;
 }
 
+/**
+ * A moment as `hh:mm dd/mm/yyyy`, for a column that has to fit on a phone.
+ *
+ * Not `toLocaleString`: that writes the reader's long form, which on a narrow
+ * table wraps onto two or three lines and pushes the size and the button out of
+ * the row. Digits in a fixed order are the same width in every language and
+ * are read the same way in both of the ones this console speaks.
+ */
+export function shortWhen(value: string): string {
+  const at = new Date(value);
+  if (Number.isNaN(at.getTime())) return '—';
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${pad(at.getHours())}:${pad(at.getMinutes())} ${pad(at.getDate())}/${pad(at.getMonth() + 1)}/${at.getFullYear()}`;
+}
+
 /** The labels every table in the console borrows, in the reader's language. */
 function tableLabels(t: Translate): DataTableLabels {
   return {
@@ -2127,20 +2326,35 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
   // moment left the title reading "Delete ?" for the length of the animation.
   const [deleteTarget, setDeleteTarget] = useState<BackupManifest | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
-  // Where the data goes and how often are two questions, so they are two forms.
-  const [r2KeysOpen, setR2KeysOpen] = useState(false);
+  /*
+   * Where the data goes and how often are two questions, so they are two forms.
+   *
+   * "Where" is one form for both ways of answering it. A sign-in and a key pair
+   * are two answers to one question, and as two rows on the card - each with
+   * its own hint, its own button and its own state - they read as two things
+   * that both needed doing. One dialog, one choice, and the card keeps a single
+   * line saying which answer is in force.
+   */
+  const [destinationOpen, setDestinationOpen] = useState(false);
   const [r2ScheduleOpen, setR2ScheduleOpen] = useState(false);
+  /*
+   * The Cloudflare sign-in address, when this page could not open it itself.
+   *
+   * Kept on the page rather than announced and taken away again. It used to be
+   * a toast: the one case where the reader has to do something with a link is
+   * the one case where the link must not vanish while they look for somewhere
+   * to put it.
+   */
+  const [cloudflareSignInUrl, setCloudflareSignInUrl] = useState<string | null>(null);
   const [r2Toggling, setR2Toggling] = useState(false);
   const [cloudflareBusy, setCloudflareBusy] = useState(false);
-  const [cloudflareAccount, setCloudflareAccount] = useState('');
-  const [bucketOpen, setBucketOpen] = useState(false);
   const [disconnectOpen, setDisconnectOpen] = useState(false);
-  // The usage panel owns its own fetch; this just lets the overflow menu's
-  // "Refresh" item reach it without lifting that state up here too.
+  // What the last look at the bucket found. Kept on the card, because an answer
+  // that disappears two seconds after it arrives is not an answer.
+  const [r2Check, setR2Check] = useState<R2CheckResult | null>(null);
+  // The usage panel owns its own fetch; this lets one press of Check bring it
+  // up to date too, instead of a second button that only refreshes.
   const usageRefresh = useRef<(() => void) | null>(null);
-  // One method at a time: taking over from the other one is asked for first.
-  const [switchToKeysOpen, setSwitchToKeysOpen] = useState(false);
-  const [switchToCloudflareOpen, setSwitchToCloudflareOpen] = useState(false);
   // Newest first: the archive somebody wants is nearly always the last one taken.
   const [backupQuery, setBackupQuery] = useState<TableQuery>(() => initialQuery({ sort: 'createdAt', direction: 'desc' }));
   const [snapshotQuery, setSnapshotQuery] = useState<TableQuery>(() => initialQuery({ pageSize: 5, sort: 'createdAt', direction: 'desc' }));
@@ -2154,8 +2368,10 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
     const [profileResponse, backupResponse, r2Response, snapshotResponse, scheduleResponse] = await Promise.all([apiFetch('/api/v1/profiles', { credentials: 'same-origin' }), apiFetch('/api/v1/backups', { credentials: 'same-origin' }), apiFetch('/api/v1/r2', { credentials: 'same-origin' }), apiFetch('/api/v1/r2/snapshots', { credentials: 'same-origin' }).catch(() => null), apiFetch('/api/v1/backups/schedule', { credentials: 'same-origin' }).catch(() => null)]);
     // Listing recovery points needs the bucket, so it is the one call here that
     // fails when R2 is off or unreachable. That must not blank the page.
-    if (snapshotResponse?.ok) setR2Snapshots((await snapshotResponse.json() as { snapshots: R2SnapshotSummary[] }).snapshots);
-    else setR2Snapshots([]);
+    if (snapshotResponse?.ok) {
+      const payload = await snapshotResponse.json() as { snapshots: R2SnapshotSummary[] };
+      setR2Snapshots(payload.snapshots);
+    } else setR2Snapshots([]);
     if (profileResponse.ok) { const payload = await profileResponse.json() as { profiles: Profile[]; activeProfileId: string | null }; onProfilesChange(payload.profiles, payload.activeProfileId); }
     if (backupResponse.ok) { const payload = await backupResponse.json() as { backups: BackupManifest[] }; onBackupsChange(payload.backups); }
     if (r2Response.ok) {
@@ -2183,10 +2399,22 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
     if (outcome === 'connected') {
       void apiFetch('/api/v1/r2', { credentials: 'same-origin' })
         .then(async (response) => (response.ok ? (await response.json() as { config: R2Config }).config : null))
-        .then((config) => toast({ title: t('console.cfConnected', { bucket: config?.cloudflare?.bucket ?? '' }), tone: 'success', duration: 8000 }))
+        .then((config) => {
+          toast({ title: t('console.cfConnected', { bucket: config?.cloudflare?.bucket ?? '' }), tone: 'success', duration: 8000 });
+          if (config) setR2Config(config);
+          // Reading the bucket is how anyone finds out whether the connection
+          // they just made actually works, and it was left as a button to
+          // press. Asked here instead, so what the reader comes back to is the
+          // answer rather than another thing to do.
+          void checkAfterConnect(config);
+        })
         .catch(() => undefined);
     } else if (outcome === 'choose_account') {
+      // The sign-in worked and the only thing left is a choice, so the form
+      // that holds that choice opens rather than being described in a message
+      // the reader then has to go and act on.
       toast({ title: t('console.cfChooseNow'), tone: 'success', duration: 8000 });
+      setDestinationOpen(true);
     } else {
       failed(cloudflareErrorText(t, code));
     }
@@ -2344,13 +2572,13 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
     })();
     return null;
   };
-  const waitForOperation = async (jobId: string, onUpdate: (job: Job) => void): Promise<void> => {
+  const waitForOperation = async (jobId: string, onUpdate: (job: Job) => void): Promise<Job> => {
     for (;;) {
       const response = await apiFetch(`/api/v1/jobs/${encodeURIComponent(jobId)}`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(t('console.backupRestoreFailed'));
       const job = await response.json() as Job;
       onUpdate(job);
-      if (job.state === 'succeeded') return;
+      if (job.state === 'succeeded') return job;
       if (job.state === 'canceled') throw new StoppedError();
       if (job.state === 'failed' && job.stepCode === 'job.rollbackFailed') throw new RollbackFailedError(job.error ?? t('console.backupRestoreFailed'));
       if (job.state === 'failed') throw new Error(job.error ?? t('console.backupRestoreFailed'));
@@ -2360,12 +2588,33 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
   const previewBackup = async (backup: BackupManifest) => {
     setBusyAction(t('console.restore'));
     try {
+      await openRestoreFor(backup);
+    } finally { setBusyAction(null); }
+  };
+  /**
+   * Look inside an archive and ask what to do with it.
+   *
+   * Shared by the Restore menu item and by whatever has just put an archive in
+   * the library - an uploaded zip, a recovery point brought back from R2 - so
+   * all three end at the same question instead of one of them ending at a
+   * notification and a list to go hunting through.
+   */
+  /** One archive by id, asked for straight rather than found again in the list. */
+  const readBackup = async (backupId: string): Promise<BackupManifest | null> => {
+    try {
+      const response = await apiFetch(`/api/v1/backups/${encodeURIComponent(backupId)}`, { credentials: 'same-origin' });
+      return response.ok ? await response.json() as BackupManifest : null;
+    } catch { return null; }
+  };
+  const openRestoreFor = async (backup: BackupManifest): Promise<boolean> => {
+    try {
       const response = await apiFetch(`/api/v1/backups/${backup.id}/preview`, { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrfToken } });
       const payload = await response.json() as RestorePreview | { error?: { message?: string } };
-      if (!response.ok || !('files' in payload)) { failed(fail.body(payload, t('console.backupPreviewFailed'))); return; }
+      if (!response.ok || !('files' in payload)) { failed(fail.body(payload, t('console.backupPreviewFailed'))); return false; }
       setRestoreMode('replace');
       setSelectedBackup(backup); setSelectedPreview(payload);
-    } catch { failed(t('console.backupPreviewFailed')); } finally { setBusyAction(null); }
+      return true;
+    } catch { failed(t('console.backupPreviewFailed')); return false; }
   };
   const closeRestore = () => { setSelectedBackup(null); setSelectedPreview(null); };
   const restoreSelected = async () => {
@@ -2486,7 +2735,7 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
    * the one that says "use the keys" - which is why the switch is asked for
    * before the form opens, not silently applied after it.
    */
-  const saveR2Keys = async (form: R2KeysForm): Promise<string | null> => await putR2({ ...form, mode: 'keys' });
+  const saveR2Keys = async (form: R2KeysForm & { readonly enabled?: boolean }): Promise<string | null> => await putR2({ ...form, mode: 'keys' });
   const saveR2Schedule = async (form: R2ScheduleForm): Promise<string | null> => await putR2({ ...form });
   // The switch lives on the card, not at the bottom of the settings dialog:
   // whether anything is being sent at all is the first thing to see, and
@@ -2516,6 +2765,7 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
     } catch { failed(t('console.r2SaveFailed')); } finally { setR2Toggling(false); }
   };
   const connectCloudflare = async () => {
+    setCloudflareSignInUrl(null);
     // Cloudflare's sign-in refuses to load in a frame. When the panel is shown
     // inside another page, the sign-in gets a tab of its own, opened now while
     // the click still counts as one so it is not taken for a pop-up.
@@ -2532,30 +2782,28 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
       // somewhere it will be refused would only blank the console. So hand
       // over the address instead and let them open it themselves.
       if (framed) {
-        const url = payload.url;
-        toast({
-          title: t('console.cfConnectPopupBlocked'),
-          description: url,
-          tone: 'attention',
-          duration: Number.POSITIVE_INFINITY,
-          action: { label: t('dashboard.copyLink'), onSelect: () => { void navigator.clipboard.writeText(url).catch(() => undefined); } },
-        });
+        setCloudflareSignInUrl(payload.url);
         return;
       }
       window.location.assign(payload.url);
     } catch { tab?.close(); failed(t('console.cfConnectFailed')); } finally { setCloudflareBusy(false); }
   };
-  const chooseCloudflareAccount = async () => {
-    if (!cloudflareAccount) return;
+  const chooseCloudflareAccount = async (accountId: string): Promise<string | null> => {
+    if (!accountId) return null;
     setCloudflareBusy(true);
     try {
-      const response = await apiFetch('/api/v1/r2/cloudflare/account', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ accountId: cloudflareAccount }) });
+      const response = await apiFetch('/api/v1/r2/cloudflare/account', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ accountId }) });
       const payload = await response.json() as { config?: R2Config; error?: { message?: string } };
-      if (!response.ok || !payload.config) { failed(fail.body(payload, t('console.cfConnectFailed'))); return; }
+      // An account that has never turned R2 on fails here with everything else
+      // in order. The refusal is on the connection now, so the card says it
+      // and keeps saying it; this only has to not swallow it.
+      if (!response.ok || !payload.config) { const message = fail.body(payload, t('console.cfConnectFailed')); failed(message); await refresh(); return message; }
       setR2Config(payload.config);
       done(t('console.cfConnected', { bucket: payload.config.cloudflare?.bucket ?? '' }));
       await refresh();
-    } catch { failed(t('console.cfConnectFailed')); } finally { setCloudflareBusy(false); }
+      await checkAfterConnect(payload.config);
+      return null;
+    } catch { failed(t('console.cfConnectFailed')); return t('console.cfConnectFailed'); } finally { setCloudflareBusy(false); }
   };
   /** Back up to another bucket of the account already signed in to. */
   const chooseCloudflareBucket = async (name: string): Promise<string | null> => {
@@ -2590,15 +2838,45 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
       setR2Config(payload.config);
       done(t('console.cfConnected', { bucket: payload.config.cloudflare?.bucket ?? '' }));
       await refresh();
+      await checkAfterConnect(payload.config);
     } catch { failed(t('console.r2SaveFailed')); } finally { setCloudflareBusy(false); }
   };
-  const testR2 = async () => {
-    setR2Busy(t('console.r2Test'));
+  /**
+   * The one question about the bucket, asked once.
+   *
+   * There used to be three buttons here - Test connection, Check the bucket,
+   * Refresh - that between them proved the credentials, brought the counts back
+   * in line and re-read Cloudflare's figures. Each was a separate press with a
+   * separate name, two of them read as the same thing, and all three answered
+   * with a notification that said it had worked and then went away. They are
+   * one press now, and the answer stays on the card.
+   */
+  const checkR2 = async () => {
+    setR2Busy(t('console.r2Checking'));
     try {
-      const response = await apiFetch('/api/v1/r2/test', { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrfToken } });
-      const payload = await response.json() as { error?: { message?: string } };
-      if (response.ok) done(t('console.r2Tested')); else failed(fail.body(payload, t('console.r2TestFailed')));
+      const response = await apiFetch('/api/v1/r2/check', { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrfToken } });
+      const payload = await response.json() as { check?: R2CheckResult; config?: R2Config; error?: { message?: string } };
+      if (!response.ok || !payload.check) { failed(fail.body(payload, t('console.r2TestFailed'))); return; }
+      setR2Check(payload.check);
+      if (payload.config) setR2Config(payload.config);
+      // What Cloudflare itself reports is the other half of the same question,
+      // so one press asks for both rather than leaving a Refresh behind.
+      usageRefresh.current?.();
+      await refresh();
     } catch { failed(t('console.r2TestFailed')); } finally { setR2Busy(null); }
+  };
+  /**
+   * Read the bucket once, straight after a connection is made.
+   *
+   * Only when there is something to read: the check needs backups to be on and
+   * the destination settled, and asking before that is a refusal the reader did
+   * nothing to cause. A failure here is the useful kind - it is the connection
+   * they just made, said plainly on the card while they are still looking at it.
+   */
+  const checkAfterConnect = async (config: R2Config | null) => {
+    if (!config?.enabled || !config.configured) return;
+    if (config.mode === 'cloudflare' && config.cloudflare?.state !== 'connected') return;
+    await checkR2();
   };
   const uploadR2 = async () => {
     setR2Busy(t('console.r2UploadLatest'));
@@ -2629,24 +2907,30 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
     setR2Busy(t('console.r2Fetch'));
     setOperationProgress(null);
     try {
-      const response = await apiFetch(`/api/v1/r2/snapshots/${encodeURIComponent(snapshot.id)}/fetch`, { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrfToken } });
+      // Which profile in the bucket wrote it, which for a point from another
+      // machine is not this one. The chunks are shared, so reading it from
+      // there and restoring it here costs nothing extra.
+      const response = await apiFetch(`/api/v1/r2/snapshots/${encodeURIComponent(snapshot.id)}/fetch`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ profileId: snapshot.profileId }) });
       const payload = await response.json() as { jobId?: string; error?: { message?: string } };
       if (!response.ok || !payload.jobId) { failed(fail.body(payload, t('console.r2FetchFailed'))); return; }
       setRunningJobId(payload.jobId);
-      await waitForOperation(payload.jobId, (job) => setOperationProgress({ percent: job.progress, step: jobStep(job) }));
-      await refresh(); toast({ title: t('console.r2Fetched'), tone: 'success', duration: 8000 });
+      const finished = await waitForOperation(payload.jobId, (job) => setOperationProgress({ percent: job.progress, step: jobStep(job) }));
+      await refresh();
+      /*
+       * Ask what to do with it, the way an uploaded zip is asked about.
+       *
+       * Bringing a recovery point back and restoring it are one intention,
+       * split in two only because the archive has to exist before it can be
+       * looked inside. Ending at a notification left the reader to go and find
+       * the row themselves, in a list where the thing they had just downloaded
+       * looked like everything else in it.
+       */
+      const landed = finished.resultBackupId ? await readBackup(finished.resultBackupId) : null;
+      if (landed && await openRestoreFor(landed)) return;
+      toast({ title: t('console.r2Fetched'), tone: 'success', duration: 8000 });
     } catch (error: unknown) {
       if (!(error instanceof StoppedError)) failed(error instanceof Error ? error.message : t('console.r2FetchFailed'));
     } finally { setR2Busy(null); setOperationProgress(null); setRunningJobId(null); }
-  };
-  const reconcileR2 = async () => {
-    setR2Busy(t('console.r2Reconcile'));
-    try {
-      const response = await apiFetch('/api/v1/r2/reconcile', { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrfToken } });
-      const payload = await response.json() as { collectedBlobs?: number; error?: { message?: string } };
-      if (!response.ok) { failed(fail.body(payload, t('console.r2ReconcileFailed'))); return; }
-      await refresh(); done(t('console.r2Reconciled'));
-    } catch { failed(t('console.r2ReconcileFailed')); } finally { setR2Busy(null); }
   };
   const removeLegacy = async () => {
     setR2Busy(t('console.r2LegacyRemove'));
@@ -2691,21 +2975,42 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
   // Backups go through the signed-in account, as opposed to it merely being connected.
   const signedIn = r2Config?.mode === 'cloudflare' && cloudflare?.state === 'connected';
   const keysConfigured = Boolean(r2Config?.endpoint && r2Config.bucket && r2Config.accessKeyIdMasked && r2Config.secretAccessKeyConfigured);
+  const destination = destinationText(t, r2Config);
+  /*
+   * When, how big, and the one thing to do with it.
+   *
+   * There used to be two more columns: which profile in the bucket wrote the
+   * point, and how many files it holds. Neither is a question anybody asks of
+   * this table - every row is the same person's data, and a file count says
+   * nothing a size does not say better - and between them they took the width
+   * that the three columns that are read need on a phone. The row now fits on
+   * one line at any width.
+   */
   const snapshotColumns: DataTableColumn<R2SnapshotSummary>[] = [
-    { id: 'createdAt', header: t('console.backupCreated'), sortable: true, cell: (snapshot) => <span className="whitespace-nowrap">{new Date(snapshot.createdAt).toLocaleString()}</span> },
+    {
+      id: 'createdAt',
+      header: t('console.backupCreated'),
+      sortable: true,
+      // Digits rather than the locale's long form below `sm`: "18:05
+      // 18/09/2026" is half the width of what `toLocaleString` writes and is
+      // read the same way in both languages.
+      cell: (snapshot) => <span className="whitespace-nowrap">
+        <span className="sm:hidden">{shortWhen(snapshot.createdAt)}</span>
+        <span className="hidden sm:inline">{new Date(snapshot.createdAt).toLocaleString()}</span>
+      </span>,
+    },
     // The data the point holds, which is what bringing it back downloads. The
     // index object alone - what this column used to show - is a few hundred
     // kilobytes whatever the profile weighs.
-    { id: 'dataBytes', header: t('console.backupSize'), sortable: true, align: 'end', showFrom: 'sm', cell: (snapshot) => <span className="whitespace-nowrap text-muted-foreground">{snapshot.dataBytes === null ? '—' : formatBytes(snapshot.dataBytes)}</span> },
-    { id: 'fileCount', header: t('console.r2Files'), align: 'end', showFrom: 'md', cell: (snapshot) => <span className="whitespace-nowrap tabular-nums text-muted-foreground">{snapshot.fileCount === null ? '—' : snapshot.fileCount.toLocaleString()}</span> },
+    { id: 'dataBytes', header: t('console.backupSize'), sortable: true, align: 'end', cell: (snapshot) => <span className="whitespace-nowrap text-muted-foreground">{snapshot.dataBytes === null ? '—' : formatBytes(snapshot.dataBytes)}</span> },
     {
       id: 'actions',
       header: <span className="sr-only">{t('console.backupActions')}</span>,
       align: 'end',
-      headClassName: 'w-32',
+      headClassName: 'w-28',
       // Not "Download": nothing leaves for the reader to carry off. The point
       // comes back into this manager's backup library, to be restored from there.
-      cell: (snapshot) => <Button variant="ghost" size="sm" onClick={() => void fetchSnapshot(snapshot)} disabled={r2Busy !== null}><History />{t('console.r2Fetch')}</Button>,
+      cell: (snapshot) => <Button variant="ghost" size="sm" className="whitespace-nowrap" onClick={() => void fetchSnapshot(snapshot)} disabled={r2Busy !== null}><History />{t('console.r2Fetch')}</Button>,
     },
   ];
 
@@ -2786,73 +3091,122 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
       <AlertDescription>{t('console.storageTemporaryBody')}</AlertDescription>
     </Alert> : null}
 
-    <Card>
-      <PanelHeading icon={<Cloud />}>{t('console.r2Title')}</PanelHeading>
+    <Card className="cloud-card">
+      <PanelHeading icon={<Cloud />}>
+        {t('console.r2Title')}
+        {/* The same mark the overview puts on the tunnel, for the same reason:
+            of everything on this page, these two are what somebody who has not
+            tried them is missing out on. */}
+        <span className="access-badge"><Star />{t('console.r2Badge')}</span>
+      </PanelHeading>
       <CardContent className="grid gap-4">
+        {/* The address the dialog handed over, still here after the dialog has
+            been closed on top of it. */}
+        {cloudflareSignInUrl && !destinationOpen ? <CloudflareSignInBanner t={t} url={cloudflareSignInUrl} onDismiss={() => setCloudflareSignInUrl(null)} /> : null}
+        {/* Said above the settings, and only while it is off: once it is on,
+            this is a sales pitch for something the reader has already bought. */}
+        {!(r2Config?.enabled && r2Config.configured) ? <p className="cloud-pitch">
+          <ShieldCheck aria-hidden="true" />
+          <span>{t('console.r2Pitch')}</span>
+        </p> : null}
+        {/*
+          * An account that has never turned R2 on. Said first and said plainly,
+          * because the sign-in worked, every permission asked for was granted,
+          * and nothing else on this card can account for there still being no
+          * bucket. It is also the only trouble here that is fixed somewhere
+          * else, so it carries the way there.
+          */}
+        {cloudflare?.problem === 'r2_not_enabled' ? <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>{t('console.cfR2NotEnabledTitle')}</AlertTitle>
+          <AlertDescription className="grid gap-2">
+            <span>{t('console.cfR2NotEnabledBody')}</span>
+            <a className="font-medium underline underline-offset-4" href={CLOUDFLARE_R2_URL} target="_blank" rel="noopener noreferrer">{t('console.cfR2NotEnabledAction')}</a>
+          </AlertDescription>
+        </Alert> : null}
+        {/*
+          * The manager put this machine's data back by itself, before anybody
+          * opened the console. Said here because it is otherwise
+          * indistinguishable from a machine that happened to still have it.
+          */}
+        {r2Config?.lastRecovery ? <Alert>
+          <History />
+          <AlertTitle>{t('console.r2RecoveredTitle')}</AlertTitle>
+          {/* How much came back, not how many files: a size is something the
+              reader can weigh against what they remember having. A recovery
+              recorded before the size was kept says the rest without it,
+              rather than claiming 0 B came back. */}
+          <AlertDescription>{r2Config.lastRecovery.sizeBytes === undefined
+            ? t('console.r2RecoveredBodyNoSize', { when: new Date(r2Config.lastRecovery.createdAt).toLocaleString() })
+            : t('console.r2RecoveredBody', { when: new Date(r2Config.lastRecovery.createdAt).toLocaleString(), size: formatBytes(r2Config.lastRecovery.sizeBytes) })}</AlertDescription>
+        </Alert> : null}
         <div>
           {/* Whether anything leaves this machine at all, first: it is the
-              question everything else on the card only answers the details of. */}
-          <DetailRow label={t('console.r2Enabled')} hint={!r2Config?.configured ? t('console.r2NeedsSetup') : r2Config.enabled ? t('console.r2EnabledOnHint') : t('console.r2EnabledOffHint')}>
-            <Switch aria-label={t('console.r2Enabled')} checked={r2Config?.enabled ?? false} disabled={!r2Config?.configured || r2Toggling} onCheckedChange={(checked) => void setR2Enabled(checked)} />
+              question everything else on the card only answers the details of.
+              How often rides in the same row, as its hint, because the interval
+              is only a question while the answer to this one is yes. */}
+          <DetailRow
+            label={t('console.r2Enabled')}
+            hint={!r2Config?.configured ? t('console.r2NeedsSetup') : r2Config.enabled ? r2ScheduleSummary(t, r2Config) : t('console.r2EnabledOffHint')}
+          >
+            {r2Config?.configured && r2Config.enabled
+              ? <Button variant="outline" size="sm" onClick={() => setR2ScheduleOpen(true)}>{t('console.r2Change')}</Button>
+              : null}
+            {/* Pressable with nothing set up, because pressing it is how somebody
+                says they want this on - and the form that makes it possible is
+                what that press should open. A switch that is simply dead, with a
+                sentence underneath naming a prerequisite, leaves the reader to
+                find the prerequisite themselves. Closed without finishing, the
+                switch goes back to off: nothing was turned on. */}
+            <Switch
+              aria-label={t('console.r2Enabled')}
+              checked={(r2Config?.enabled ?? false) && (r2Config?.configured ?? false)}
+              disabled={r2Toggling}
+              onCheckedChange={(checked) => { if (checked && !r2Config?.configured) setDestinationOpen(true); else void setR2Enabled(checked); }}
+            />
           </DetailRow>
-          {/* Then where it goes: the sign-in and its bucket, or manual keys.
-              Only one of the two carries the backups. Once one is chosen, the
-              other collapses to a single quiet link instead of a full row
-              with its own hint and button - picking Cloudflare is not an
-              invitation to also go copy keys, and the other way round. */}
-          {cloudflare ? <CloudflareRow
-            t={t}
-            status={cloudflare}
-            mode={r2Config?.mode ?? 'keys'}
-            busy={cloudflareBusy}
-            account={cloudflareAccount}
-            onAccountChange={setCloudflareAccount}
-            onConnect={() => void connectCloudflare()}
-            onChooseAccount={() => void chooseCloudflareAccount()}
-            onDisconnect={() => setDisconnectOpen(true)}
-            onUseForBackups={() => { if (keysConfigured) setSwitchToCloudflareOpen(true); else void backUpToCloudflare(); }}
-            onChangeBucket={() => setBucketOpen(true)}
-            compact={cloudflare.state === 'disconnected' && keysConfigured}
-          /> : null}
-          {signedIn
-            ? <Button variant="link" size="sm" className="h-auto justify-start p-0 text-xs text-muted-foreground" onClick={() => setSwitchToKeysOpen(true)}>{t('console.r2KeysInsteadLink')}</Button>
-            : <DetailRow
-              label={cloudflare ? t('console.r2KeysRow') : t('console.r2Connection')}
-              hint={!keysConfigured ? t('console.r2KeysHint') : r2Config?.mode === 'keys' ? t('console.r2KeysHintActive') : t('console.r2KeysHintInactive')}
-            >
-              <Button variant="outline" size="sm" onClick={() => setR2KeysOpen(true)}>{keysConfigured ? t('console.r2Change') : t('console.r2Configure')}</Button>
-            </DetailRow>}
-          {/* Then how often, and then the same actions in either mode. */}
-          {r2Config?.configured ? <DetailRow label={t('console.r2Schedule')} hint={r2ScheduleSummary(t, r2Config)}>
-            <Button variant="outline" size="sm" onClick={() => setR2ScheduleOpen(true)}>{t('console.r2Change')}</Button>
-          </DetailRow> : null}
-          {/* One primary action, everything else - test, reconcile, remove
-              legacy backups - behind the overflow menu rather than a row of
-              buttons that only a few of which matter on a given day. */}
+          {/* Then where it goes. One row whichever way the bucket is reached,
+              because it is one question; the two ways of answering it are both
+              inside the one form behind this button. */}
+          <DetailRow label={t('console.r2Destination')} hint={destination}>
+            <Button variant="outline" size="sm" onClick={() => setDestinationOpen(true)}>{r2Config?.configured ? t('console.r2Change') : t('console.r2DestinationSet')}</Button>
+          </DetailRow>
+          {/* Then the two things there are to do with a bucket: send to it now,
+              and look at it. Everything else that used to be a button here
+              answered some part of "look at it" and is folded into Check. */}
           {r2Config?.configured ? <DetailRow label={t('console.r2LastUpload')} hint={r2Config.lastUploadAt ? new Date(r2Config.lastUploadAt).toLocaleString() : '—'}>
-            <Button size="sm" onClick={() => void uploadR2()} disabled={r2Busy !== null || !r2Config.enabled}><Upload />{t('console.r2UploadLatest')}</Button>
-            <DropdownMenu>
+            {/* One under the other, not side by side. Two buttons in a row
+                needed more width than the card has on a phone, and what gave
+                way was the label beside them. Stacked, each keeps its own
+                width and the name of the row stays on one line. */}
+            <div className="grid gap-2">
+              <Button size="sm" onClick={() => void uploadR2()} disabled={r2Busy !== null || !r2Config.enabled}><Upload />{t('console.r2UploadLatest')}</Button>
+              <Tooltip><TooltipTrigger asChild><span className="inline-flex">
+                <Button variant="outline" size="sm" className="w-full" onClick={() => void checkR2()} disabled={r2Busy !== null}><ShieldCheck />{t('console.r2CheckNow')}</Button>
+              </span></TooltipTrigger><TooltipContent>{t('console.r2CheckHint')}</TooltipContent></Tooltip>
+            </div>
+            {/* Backups taken under the old whole-file scheme. Nothing reads them
+                any more, but they are the operator's, so removing them is asked
+                for rather than assumed - and this menu exists only when there
+                is something in it. */}
+            {r2Config.usage.legacyObjectCount > 0 ? <DropdownMenu>
               <DropdownMenuTrigger asChild><Button variant="ghost" size="icon-sm" aria-label={t('console.r2More')} disabled={r2Busy !== null}><Ellipsis /></Button></DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => void testR2()}><ShieldCheck />{t('console.r2Test')}</DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => void reconcileR2()}>{t('console.r2Reconcile')}</DropdownMenuItem>
-                {/* The one figure that comes from Cloudflare rather than the
-                    manager's own count, so it gets its own refresh - but still
-                    in this same menu, not a second button elsewhere on the card. */}
-                {signedIn ? <><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => usageRefresh.current?.()}>{t('console.cfUsageRefresh')}</DropdownMenuItem></> : null}
-                {/* Backups taken under the old whole-file scheme. Nothing reads
-                    them any more, but they are the operator's, so removing them
-                    is asked for rather than assumed. */}
-                {r2Config.usage.legacyObjectCount > 0
-                  ? <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onSelect={() => void removeLegacy()}><Trash2 />{t('console.r2LegacyRemove')} ({formatBytes(r2Config.usage.legacyBytes)})</DropdownMenuItem></>
-                  : null}
+                <DropdownMenuItem variant="destructive" onSelect={() => void removeLegacy()}><Trash2 />{t('console.r2LegacyRemove')} ({formatBytes(r2Config.usage.legacyBytes)})</DropdownMenuItem>
               </DropdownMenuContent>
-            </DropdownMenu>
+            </DropdownMenu> : null}
           </DetailRow> : null}
         </div>
+        {/* What the last look at the bucket found, kept where the reader was
+            looking when they asked for it. */}
+        {r2Check ? <R2CheckLine t={t} check={r2Check} /> : null}
         {r2Busy ? <OperationProgress t={t} label={r2Busy} progress={operationProgress} canStop={runningJobId !== null} stopping={stopping} onStop={() => void stopOperation()} warning={null} /> : null}
         {signedIn && cloudflare?.restReason ? <Alert><TriangleAlert /><AlertDescription>{t(cloudflare.restReason === 'workers_not_granted' ? 'console.cfSlowNotGranted' : 'console.cfSlowUnavailable')}</AlertDescription></Alert> : null}
-        {signedIn && r2Config?.lastUploadAt === null && r2Snapshots.length > 0 ? <Alert><Cloud /><AlertDescription>{t('console.cfNewMachine', { count: r2Snapshots.length })}</AlertDescription></Alert> : null}
+        {r2Config?.configured && activeProfile === null && r2Snapshots.length > 0
+          ? <Alert><Cloud /><AlertDescription>{t('console.r2AwaitingInstall', { count: r2Snapshots.length })}</AlertDescription></Alert>
+          : r2Config?.configured && r2Config.lastUploadAt === null && r2Snapshots.length > 0
+            ? <Alert><Cloud /><AlertDescription>{t('console.cfNewMachine', { count: r2Snapshots.length })}</AlertDescription></Alert>
+            : null}
         {r2Config?.configured ? <>
           {/* One set of figures, not two: Cloudflare's own when it can be asked,
               because it sees every machine on the bucket, and the manager's
@@ -2865,14 +3219,15 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
             <DataTable
               rows={r2Snapshots}
               columns={snapshotColumns}
-              rowKey={(snapshot) => snapshot.id}
+              rowKey={(snapshot) => `${snapshot.profileId}/${snapshot.id}`}
               query={snapshotQuery}
               onQueryChange={setSnapshotQuery}
               labels={labels}
               sortValue={snapshotSortValue}
               pageSizes={[5, 10, 25]}
-              empty={<EmptyState icon={<Cloud />} title={t('console.r2NoSnapshots')} description={t('console.r2FetchNote')} />}
+              empty={<EmptyState icon={<Cloud />} title={t('console.r2NoSnapshots')} description={t('console.r2NoSnapshotsBody')} />}
             />
+            <p className="text-xs text-muted-foreground">{t('console.r2FetchNote')}</p>
           </div>
         </> : null}
       </CardContent>
@@ -2919,9 +3274,23 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
       onConfirm={deleteBackup}
     />
     <RestoreDialog t={t} catalog={catalog} displayName={displayName} backup={selectedBackup} preview={selectedPreview} mode={restoreMode} onModeChange={setRestoreMode} onClose={closeRestore} onRestore={restoreSelected} />
-    <R2KeysDialog t={t} open={r2KeysOpen} onOpenChange={setR2KeysOpen} config={r2Config} onSave={saveR2Keys} />
+    <R2DestinationDialog
+      t={t}
+      open={destinationOpen}
+      onOpenChange={setDestinationOpen}
+      startEnabled={!r2Config?.enabled}
+      config={r2Config}
+      busy={cloudflareBusy}
+      signInUrl={cloudflareSignInUrl}
+      onDismissSignIn={() => setCloudflareSignInUrl(null)}
+      onConnect={() => void connectCloudflare()}
+      onChooseAccount={chooseCloudflareAccount}
+      onChooseBucket={chooseCloudflareBucket}
+      onDisconnect={() => setDisconnectOpen(true)}
+      onUseCloudflare={backUpToCloudflare}
+      onSaveKeys={saveR2Keys}
+    />
     <R2ScheduleDialog t={t} open={r2ScheduleOpen} onOpenChange={setR2ScheduleOpen} config={r2Config} onSave={saveR2Schedule} />
-    <CloudflareBucketDialog t={t} open={bucketOpen} onOpenChange={setBucketOpen} current={cloudflare?.bucket ?? null} onSave={chooseCloudflareBucket} />
     <ConfirmDialog
       open={disconnectOpen}
       onOpenChange={setDisconnectOpen}
@@ -2931,25 +3300,40 @@ function DataPage({ t, locale, fail, catalog, csrfToken, profiles, activeProfile
       cancelLabel={t('common.cancel')}
       onConfirm={disconnectCloudflare}
     />
-    <ConfirmDialog
-      open={switchToKeysOpen}
-      onOpenChange={setSwitchToKeysOpen}
-      title={t('console.r2SwitchToKeysTitle')}
-      description={t('console.r2SwitchToKeysBody')}
-      confirmLabel={t('console.r2SwitchToKeysConfirm')}
-      cancelLabel={t('common.cancel')}
-      onConfirm={() => { setSwitchToKeysOpen(false); setR2KeysOpen(true); }}
-    />
-    <ConfirmDialog
-      open={switchToCloudflareOpen}
-      onOpenChange={setSwitchToCloudflareOpen}
-      title={t('console.r2SwitchToCloudflareTitle')}
-      description={t('console.r2SwitchToCloudflareBody')}
-      confirmLabel={t('console.r2SwitchToCloudflareConfirm')}
-      cancelLabel={t('common.cancel')}
-      onConfirm={() => { setSwitchToCloudflareOpen(false); void backUpToCloudflare(); }}
-    />
   </div>;
+}
+
+/** Where backups go, in the reader's words, whichever way the bucket is reached. */
+function destinationText(t: Translate, config: R2Config | null): string {
+  if (!config?.configured) return t('console.r2DestinationNone');
+  const bucket = (config.mode === 'cloudflare' ? config.cloudflare?.bucket : config.bucket) || t('console.r2DestinationUnnamed');
+  return config.mode === 'cloudflare'
+    ? t('console.r2DestinationCloudflare', { bucket, account: config.cloudflare?.account?.name ?? '' })
+    : t('console.r2DestinationKeys', { bucket });
+}
+
+/** Cloudflare's own R2 page, where an account that has not enabled R2 enables it. */
+const CLOUDFLARE_R2_URL = 'https://dash.cloudflare.com/?to=/:account/r2/overview';
+
+/**
+ * What the last look at the bucket found.
+ *
+ * One line, in the place the button that asked for it is, and it stays until
+ * something replaces it. The three buttons this replaced each answered in a
+ * notification that was gone in a few seconds, which meant the reader could
+ * press a button, look away, and be left exactly as uncertain as before.
+ */
+function R2CheckLine({ t, check }: { t: Translate; check: R2CheckResult }) {
+  const when = new Date(check.checkedAt);
+  const fresh = Date.now() - when.getTime() < 60_000;
+  if (!check.failure) {
+    return <p className="text-xs text-muted-foreground">
+      <span className="font-medium text-(--success)">{fresh ? t('console.r2CheckedJustNow') : t('console.r2CheckedAt', { time: when.toLocaleTimeString() })}</span>
+      {' \u00b7 '}
+      {t('console.r2CheckOk', { size: formatBytes(check.totalBytes), points: check.snapshotCount.toLocaleString() })}
+    </p>;
+  }
+  return <Alert variant="destructive"><TriangleAlert /><AlertDescription>{t('console.r2CheckFailed', { error: check.failure.message })}</AlertDescription></Alert>;
 }
 
 /**
@@ -3095,52 +3479,310 @@ function RestoreDialog({ t, catalog, displayName, backup, preview, mode, onModeC
 }
 
 /**
- * The endpoint, bucket and key pair, and nothing else.
+ * The Cloudflare sign-in address, for a page that cannot open it itself.
  *
- * Where the data goes and how often it goes there used to be two tabs of one
- * dialog, which made every save touch both. They are separate questions asked
- * at separate times - keys once, schedule whenever - so they are separate
- * forms, and each one sends only its own fields.
+ * Cloudflare's sign-in refuses to load in a frame, so a console shown inside
+ * another page has to hand the address over instead of following it. That used
+ * to be a notification, which is the wrong shape for it twice over: it goes
+ * away while the reader is still looking at it, and it left them nothing to
+ * press but Copy - so the one path out of a framed console was copy the link,
+ * find the address bar, paste. A banner stays, and carries both: open it here,
+ * or take the address somewhere else.
  */
-function R2KeysDialog({ t, open, onOpenChange, config, onSave }: { t: Translate; open: boolean; onOpenChange: (open: boolean) => void; config: R2Config | null; onSave: (form: R2KeysForm) => Promise<string | null> }) {
-  const [form, setForm] = useState<R2KeysForm>(() => r2KeysFrom(config));
-  const [busy, setBusy] = useState(false);
+function CloudflareSignInBanner({ t, url, onDismiss }: { t: Translate; url: string; onDismiss: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const { toast } = useToast();
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // The address is on screen and can be selected, so a clipboard the
+      // browser will not hand over is worth saying and nothing more.
+      toast({ title: t('console.copyFailed'), tone: 'destructive' });
+    }
+  };
+  return <Alert>
+    <CloudflareMark />
+    <AlertTitle>{t('console.cfConnectOpenHere')}</AlertTitle>
+    <AlertDescription className="grid gap-2">
+      <span>{t('console.cfConnectPopupBlocked')}</span>
+      <a className="break-all font-mono text-xs underline underline-offset-4" href={url} target="_blank" rel="noopener noreferrer">{url}</a>
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" asChild><a href={url} target="_blank" rel="noopener noreferrer"><ArrowUpRight />{t('console.openInTab')}</a></Button>
+        <Button variant="outline" size="sm" onClick={() => void copy()}><Copy />{copied ? t('console.linkCopied') : t('dashboard.copyLink')}</Button>
+        <Button variant="ghost" size="sm" onClick={onDismiss}>{t('common.close')}</Button>
+      </div>
+    </AlertDescription>
+  </Alert>;
+}
+
+/**
+ * Where backups go, asked once, with both ways of answering it in view.
+ *
+ * There is one question here - which bucket, reached how - and the card used to
+ * ask it as two rows that each had a state, a hint and a button of their own:
+ * a Cloudflare row with five shapes and a keys row with three, plus two
+ * confirmations for moving between them and a third dialog for the bucket. A
+ * reader who had signed in was still being shown a row inviting them to go and
+ * copy keys, and a reader who had entered keys was shown the other. Neither row
+ * said which one the backups were actually going through without being read
+ * carefully.
+ *
+ * It is one form now. Two answers side by side, the one in force marked as
+ * such, and everything each answer needs - signing in, picking an account,
+ * picking a bucket, signing out, the four fields - inside the answer it belongs
+ * to. Saving means "use this one", which is the choice that used to need a
+ * confirmation dialog of its own, asked here where it is being made.
+ */
+function R2DestinationDialog({ t, open, onOpenChange, config, busy, startEnabled, signInUrl, onDismissSignIn, onConnect, onChooseAccount, onChooseBucket, onDisconnect, onUseCloudflare, onSaveKeys }: {
+  t: Translate;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  config: R2Config | null;
+  busy: boolean;
+  /** Opened by a switch somebody just turned on, so finishing here turns it on. */
+  startEnabled: boolean;
+  /** Set when this page could not open Cloudflare's sign-in and handed it over instead. */
+  signInUrl: string | null;
+  onDismissSignIn: () => void;
+  onConnect: () => void;
+  onChooseAccount: (accountId: string) => Promise<string | null>;
+  onChooseBucket: (name: string) => Promise<string | null>;
+  onDisconnect: () => void;
+  onUseCloudflare: () => Promise<void>;
+  onSaveKeys: (form: R2KeysForm & { readonly enabled?: boolean }) => Promise<string | null>;
+}) {
+  const group = useId();
+  const cloudflare = config?.cloudflare ?? null;
+  const mode = config?.mode ?? 'keys';
+  /*
+   * Which answer the form opens on.
+   *
+   * Whatever is already carrying the backups, and the sign-in when nothing is.
+   * It used to open on the keys - the stored default before anything had been
+   * chosen - which put four empty fields in front of somebody on a form whose
+   * recommended answer, one line above, was greyed out until they had already
+   * done the thing the form was for.
+   */
+  const [choice, setChoice] = useState<R2ConnectionMode>(mode);
+  const [keys, setKeys] = useState<R2KeysForm>(() => r2KeysFrom(config));
+  const [account, setAccount] = useState('');
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => { if (open) { setForm(r2KeysFrom(config)); setError(null); } }, [open, config]);
-  const set = (patch: Partial<R2KeysForm>) => setForm((current) => ({ ...current, ...patch }));
-  // Set in `.env`: shown so the reader knows where it comes from, not editable,
-  // because the server would ignore the edit.
+  // The dialog stays mounted, so what was typed last time is cleared on the way
+  // in. Opening it after a sign-in that is waiting on a choice of account opens
+  // it on the Cloudflare side, which is the side that is waiting.
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    setKeys(r2KeysFrom(config));
+    setAccount(cloudflare?.accounts[0]?.id ?? '');
+    setChoice(!cloudflare ? 'keys' : config?.configured ? mode : 'cloudflare');
+  }, [open]);
+
+  // Set in `.env`: shown so the reader knows where the value comes from, and
+  // not editable, because the server reads `.env` on every start and would
+  // ignore the edit.
   const fromEnvironment = new Set<string>(config?.environmentFields ?? []);
+  const keysReady = Boolean(keys.endpoint.trim() && keys.bucket.trim() && keys.accessKeyId.trim() && (keys.secretAccessKey.trim() || config?.secretAccessKeyConfigured));
+  const connected = cloudflare?.state === 'connected';
+  // Choosing the sign-in is allowed before signing in - that is how somebody
+  // says which way they want to go. What waits for it is Save, because there is
+  // no bucket to save yet, and the row below says so rather than leaving a dead
+  // button to be puzzled over.
+  const canSave = choice === 'keys' ? keysReady : connected;
+  const cloudflarePending = choice === 'cloudflare' && Boolean(cloudflare) && !connected;
 
   const save = async () => {
-    setBusy(true); setError(null);
+    if (!canSave || saving) return;
+    setSaving(true); setError(null);
     try {
-      const failure = await onSave(form);
-      setError(failure);
-      if (!failure) onOpenChange(false);
-    } finally { setBusy(false); }
+      // Saving is choosing. Keys are sent with the mode that uses them; the
+      // sign-in has nothing to send but the choice itself.
+      if (choice === 'keys') {
+        const failure = await onSaveKeys({ ...keys, ...(startEnabled ? { enabled: true } : {}) });
+        setError(failure);
+        if (failure) return;
+      } else if (mode !== 'cloudflare' || startEnabled) {
+        await onUseCloudflare();
+      }
+      onOpenChange(false);
+    } finally { setSaving(false); }
   };
 
   return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent className="sm:max-w-lg">
+    <DialogContent className="sm:max-w-xl">
       <DialogHeader>
-        <DialogTitle>{t('console.r2KeysTitle')}</DialogTitle>
-        <DialogDescription>{t('console.r2SetupBody')}</DialogDescription>
+        <DialogTitle>{t('console.r2DestinationTitle')}</DialogTitle>
+        <DialogDescription>{t('console.r2DestinationBody')}</DialogDescription>
       </DialogHeader>
       <DialogBody className="grid gap-4">
         {fromEnvironment.size > 0 ? <Alert><AlertDescription>{t('console.r2FromEnv')}</AlertDescription></Alert> : null}
-        <Field label={t('console.r2Endpoint')}><Input value={form.endpoint} onChange={(event) => set({ endpoint: event.target.value })} placeholder="https://ACCOUNT_ID.r2.cloudflarestorage.com" autoComplete="off" disabled={fromEnvironment.has('endpoint')} /></Field>
-        <Field label={t('console.r2Bucket')}><Input value={form.bucket} onChange={(event) => set({ bucket: event.target.value })} autoComplete="off" disabled={fromEnvironment.has('bucket')} /></Field>
-        <Field label={t('console.r2AccessKey')}><Input value={form.accessKeyId} onChange={(event) => set({ accessKeyId: event.target.value })} autoComplete="off" disabled={fromEnvironment.has('accessKeyId')} /></Field>
-        <Field label={t('console.r2SecretKey')}><PasswordInput revealLabel={t('setup.reveal')} hideLabel={t('setup.hide')} value={form.secretAccessKey} onChange={(event) => set({ secretAccessKey: event.target.value })} autoComplete="new-password" disabled={fromEnvironment.has('secretAccessKey')} /></Field>
-        {error ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert> : null}
+        {signInUrl ? <CloudflareSignInBanner t={t} url={signInUrl} onDismiss={onDismissSignIn} /> : null}
+        <RadioGroup value={choice} onValueChange={(value) => setChoice(value as R2ConnectionMode)} aria-label={t('console.r2DestinationTitle')}>
+          {/* Signing in first, and marked as the one to reach for: it makes the
+              bucket, keeps its own keys and is the only one that can show what
+              Cloudflare says the account has used. */}
+          {cloudflare ? <div className="grid gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:bg-primary/5">
+            <div className="flex items-start gap-3">
+              <RadioGroupItem id={`${group}-cloudflare`} value="cloudflare" className="mt-0.5" />
+              <div className="grid gap-1">
+                <Label htmlFor={`${group}-cloudflare`} className="flex flex-wrap items-center gap-2 font-medium">
+                  <CloudflareMark />{t('console.r2MethodCloudflare')}
+                  <Badge variant="secondary" className="bg-(--success-background) text-(--success)">{t('console.r2Recommended')}</Badge>
+                  {mode === 'cloudflare' && connected ? <Badge variant="outline">{t('console.r2MethodInUse')}</Badge> : null}
+                </Label>
+                <p className="text-xs text-muted-foreground">{t('console.r2MethodCloudflareBody')}</p>
+              </div>
+            </div>
+            <CloudflareMethod
+              t={t}
+              status={cloudflare}
+              busy={busy || saving}
+              account={account}
+              onAccountChange={setAccount}
+              onConnect={onConnect}
+              onChooseAccount={async () => { setError(await onChooseAccount(account)); }}
+              onChooseBucket={async (name) => { setError(await onChooseBucket(name)); }}
+              onDisconnect={onDisconnect}
+            />
+          </div> : null}
+          <div className="grid gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:bg-primary/5">
+            <div className="flex items-start gap-3">
+              <RadioGroupItem id={`${group}-keys`} value="keys" className="mt-0.5" />
+              <div className="grid gap-1">
+                <Label htmlFor={`${group}-keys`} className="flex flex-wrap items-center gap-2 font-medium">
+                  {t('console.r2MethodKeys')}
+                  {mode === 'keys' && config?.configured ? <Badge variant="outline">{t('console.r2MethodInUse')}</Badge> : null}
+                </Label>
+                <p className="text-xs text-muted-foreground">{t('console.r2MethodKeysBody')}</p>
+              </div>
+            </div>
+            {/* The fields are here rather than behind a further button: this is
+                already the form for answering the question, and a form that
+                opens a second form to be filled in is one step too many. */}
+            {choice === 'keys' ? <div className="grid gap-3">
+              <Field label={t('console.r2Endpoint')}><Input value={keys.endpoint} onChange={(event) => setKeys({ ...keys, endpoint: event.target.value })} placeholder="https://ACCOUNT_ID.r2.cloudflarestorage.com" autoComplete="off" disabled={fromEnvironment.has('endpoint')} /></Field>
+              <Field label={t('console.r2Bucket')}><Input value={keys.bucket} onChange={(event) => setKeys({ ...keys, bucket: event.target.value })} autoComplete="off" disabled={fromEnvironment.has('bucket')} /></Field>
+              <Field label={t('console.r2AccessKey')}><Input value={keys.accessKeyId} onChange={(event) => setKeys({ ...keys, accessKeyId: event.target.value })} autoComplete="off" disabled={fromEnvironment.has('accessKeyId')} /></Field>
+              <Field label={t('console.r2SecretKey')}><PasswordInput revealLabel={t('setup.reveal')} hideLabel={t('setup.hide')} value={keys.secretAccessKey} onChange={(event) => setKeys({ ...keys, secretAccessKey: event.target.value })} autoComplete="new-password" disabled={fromEnvironment.has('secretAccessKey')} /></Field>
+              <p className="text-xs text-muted-foreground">{t('console.r2SetupBody')}</p>
+            </div> : null}
+          </div>
+        </RadioGroup>
+        {/* An account that has not enabled R2 already says so, in the row where
+            it was chosen and with the way to fix it attached. Saying it again
+            down here in the general failure slot is the same sentence twice. */}
+        {error && !(choice === 'cloudflare' && cloudflare?.problem === 'r2_not_enabled') ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert> : null}
       </DialogBody>
       <DialogFooter>
-        <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>{t('common.cancel')}</Button>
-        <Button onClick={() => void save()} disabled={busy}>{t('common.save')}</Button>
+        {cloudflarePending ? <span className="mr-auto text-xs text-muted-foreground">{t('console.r2SaveNeedsCloudflare')}</span> : null}
+        <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={saving}>{t('common.cancel')}</Button>
+        <Button onClick={() => void save()} disabled={saving || !canSave}>{t('common.save')}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>;
+}
+
+/**
+ * The Cloudflare half of that question, in whatever state the sign-in is in.
+ *
+ * Four states and one of them - connected - carries the bucket picker, because
+ * which bucket of the account is part of the same answer and not worth a
+ * dialog of its own on top of this one. The buckets are asked for when this
+ * first shows connected, which is the only moment the list is wanted.
+ */
+function CloudflareMethod({ t, status, busy, account, onAccountChange, onConnect, onChooseAccount, onChooseBucket, onDisconnect }: {
+  t: Translate;
+  status: NonNullable<R2Config['cloudflare']>;
+  busy: boolean;
+  account: string;
+  onAccountChange: (id: string) => void;
+  onConnect: () => void;
+  onChooseAccount: () => Promise<void>;
+  onChooseBucket: (name: string) => Promise<void>;
+  onDisconnect: () => void;
+}) {
+  // Cloudflare's own colour, because this button hands the reader over to
+  // Cloudflare and they decide whether to trust it by recognising it.
+  const brand = { backgroundColor: CLOUDFLARE_ORANGE, color: '#fff' };
+  const [buckets, setBuckets] = useState<CloudflareBucketOption[] | null>(null);
+  const [bucketError, setBucketError] = useState<string | null>(null);
+  const connected = status.state === 'connected';
+  useEffect(() => {
+    if (!connected) { setBuckets(null); return undefined; }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await apiFetch('/api/v1/r2/cloudflare/buckets', { credentials: 'same-origin' });
+        const payload = await response.json() as { buckets?: CloudflareBucketOption[]; error?: { message?: string } };
+        if (cancelled) return;
+        if (!response.ok || !payload.buckets) { setBucketError(payload.error?.message ?? t('console.cfBucketsFailed')); return; }
+        setBuckets(payload.buckets);
+      } catch { if (!cancelled) setBucketError(t('console.cfBucketsFailed')); }
+    })();
+    return () => { cancelled = true; };
+  }, [connected, status.bucket]);
+
+  if (status.state === 'disconnected') {
+    return <Button size="sm" style={brand} className="w-fit hover:opacity-90" onClick={onConnect} disabled={busy}><CloudflareMark />{t('console.cfConnect')}</Button>;
+  }
+  if (status.state === 'reconnect_required') {
+    return <div className="grid gap-2">
+      <p className="text-xs text-muted-foreground">{t('console.cfReconnectHint')}</p>
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" style={brand} className="hover:opacity-90" onClick={onConnect} disabled={busy}><RefreshCw />{t('console.cfReconnect')}</Button>
+        <Button variant="outline" size="sm" onClick={onDisconnect} disabled={busy}>{t('console.cfDisconnect')}</Button>
+      </div>
+    </div>;
+  }
+  if (status.state === 'choose_account') {
+    return <div className="grid gap-2">
+      <p className="text-xs text-muted-foreground">{t('console.cfChooseAccount')}</p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={account} onValueChange={onAccountChange}>
+          <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {status.accounts.map((entry) => <SelectItem key={entry.id} value={entry.id}>{entry.name}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Button size="sm" onClick={() => void onChooseAccount()} disabled={busy || !account}>{t('console.cfUseAccount')}</Button>
+        {/* Signed in, with the account still to pick - and no way back out. The
+            grant exists from this point on, so the way to give it back has to
+            exist from this point on too, and this is where somebody who has
+            just seen that the account cannot be used needs it. Outlined, not
+            ghosted: it ends a connection, and it has to read as something that
+            can be pressed. */}
+        <Button variant="outline" size="sm" onClick={onDisconnect} disabled={busy}>{t('console.cfDisconnect')}</Button>
+      </div>
+      {/* An account that has not turned R2 on fails the moment it is chosen,
+          with the sign-in itself in perfect order. The way out is on Cloudflare. */}
+      {status.problem === 'r2_not_enabled' ? <Alert variant="destructive"><TriangleAlert /><AlertDescription className="grid gap-2">
+        <span>{t('console.cfR2NotEnabledBody')}</span>
+        <a className="font-medium underline underline-offset-4" href={CLOUDFLARE_R2_URL} target="_blank" rel="noopener noreferrer">{t('console.cfR2NotEnabledAction')}</a>
+      </AlertDescription></Alert> : null}
+    </div>;
+  }
+  return <div className="grid gap-2">
+    <p className="text-xs text-muted-foreground">{t('console.cfConnectedAs', { account: status.account?.name ?? '', bucket: status.bucket ?? '' })}</p>
+    <div className="flex flex-wrap items-center gap-2">
+      {buckets === null && !bucketError
+        ? <Skeleton className="h-9 w-56" />
+        : buckets?.length === 0
+        ? <p className="text-xs text-muted-foreground">{t('console.cfBucketsEmpty')}</p>
+        : <Select value={status.bucket ?? ''} onValueChange={(name) => { if (name !== status.bucket) void onChooseBucket(name); }} disabled={busy || buckets === null}>
+          <SelectTrigger className="w-56" aria-label={t('console.cfBucketLabel')}><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {(buckets ?? []).map((bucket) => <SelectItem key={`${bucket.jurisdiction}/${bucket.name}`} value={bucket.name}>{bucket.name}</SelectItem>)}
+          </SelectContent>
+        </Select>}
+      <Button variant="outline" size="sm" onClick={onDisconnect} disabled={busy}>{t('console.cfDisconnect')}</Button>
+    </div>
+    <p className="text-xs text-muted-foreground">{t('console.cfBucketBody')}</p>
+    {bucketError ? <p className="text-xs text-destructive">{bucketError}</p> : null}
+  </div>;
 }
 
 /**
@@ -3229,71 +3871,6 @@ function R2ScheduleDialog({ t, open, onOpenChange, config, onSave }: { t: Transl
   </Dialog>;
 }
 
-/**
- * Which bucket of the signed-in account holds the backups.
- *
- * The account's own buckets are offered rather than a name to type, because a
- * name that matches nothing is refused and a name that matches the wrong
- * bucket is worse. Opening the dialog is what asks Cloudflare for the list.
- */
-function CloudflareBucketDialog({ t, open, onOpenChange, current, onSave }: { t: Translate; open: boolean; onOpenChange: (open: boolean) => void; current: string | null; onSave: (name: string) => Promise<string | null> }) {
-  const [buckets, setBuckets] = useState<CloudflareBucketOption[] | null>(null);
-  const [chosen, setChosen] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    if (!open) return;
-    setError(null); setBuckets(null); setChosen(current ?? '');
-    let cancelled = false;
-    void (async () => {
-      try {
-        const response = await apiFetch('/api/v1/r2/cloudflare/buckets', { credentials: 'same-origin' });
-        const payload = await response.json() as { buckets?: CloudflareBucketOption[]; error?: { message?: string } };
-        if (cancelled) return;
-        if (!response.ok || !payload.buckets) { setError(payload.error?.message ?? t('console.cfBucketsFailed')); return; }
-        setBuckets(payload.buckets);
-      } catch { if (!cancelled) setError(t('console.cfBucketsFailed')); }
-    })();
-    return () => { cancelled = true; };
-  }, [open, current]);
-
-  const save = async () => {
-    if (!chosen) return;
-    setBusy(true); setError(null);
-    try {
-      const failure = await onSave(chosen);
-      setError(failure);
-      if (!failure) onOpenChange(false);
-    } finally { setBusy(false); }
-  };
-
-  return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent className="sm:max-w-md">
-      <DialogHeader>
-        <DialogTitle>{t('console.cfBucketTitle')}</DialogTitle>
-        <DialogDescription>{t('console.cfBucketBody')}</DialogDescription>
-      </DialogHeader>
-      <DialogBody className="grid gap-4">
-        {buckets === null && !error ? <Skeleton className="h-9 w-full" /> : null}
-        {buckets !== null && buckets.length === 0 ? <p className="text-sm text-muted-foreground">{t('console.cfBucketsEmpty')}</p> : null}
-        {buckets !== null && buckets.length > 0 ? <Field label={t('console.cfBucketLabel')}>
-          <Select value={chosen} onValueChange={setChosen}>
-            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {buckets.map((bucket) => <SelectItem key={`${bucket.jurisdiction}/${bucket.name}`} value={bucket.name}>{bucket.name}</SelectItem>)}
-            </SelectContent>
-          </Select>
-        </Field> : null}
-        {error ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert> : null}
-      </DialogBody>
-      <DialogFooter>
-        <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>{t('common.cancel')}</Button>
-        <Button onClick={() => void save()} disabled={busy || !chosen || chosen === current}>{t('common.save')}</Button>
-      </DialogFooter>
-    </DialogContent>
-  </Dialog>;
-}
-
 /** One bucket as the server lists them for the picker. */
 interface CloudflareBucketOption {
   readonly name: string;
@@ -3305,85 +3882,8 @@ function cloudflareErrorText(t: Translate, code: string): string {
   if (code === 'cloudflare_state_mismatch') return t('console.cfErrorStateMismatch');
   if (code === 'cloudflare_authorization_denied') return t('console.cfErrorDenied');
   if (code === 'cloudflare_not_available') return t('console.cfErrorUnavailable');
+  if (code === 'cloudflare_r2_not_enabled') return t('console.cfErrorR2NotEnabled');
   return t('console.cfErrorGeneric', { code: code || 'unknown' });
-}
-
-/** Cloudflare's own logo mark, used on the connect button. */
-function CloudflareLogo({ size = 16 }: { size?: number }) {
-  return <svg width={size} height={size} viewBox="0 0 109 82" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-    <path d="M76.1 55.5c.5-1.6.3-3-.5-4.1-.8-1-2-1.6-3.5-1.7l-39.5-.5c-.3 0-.6-.2-.8-.4-.2-.2-.2-.5-.1-.8.2-.5.8-.9 1.4-.9l39.8-.5c4.7-.2 9.8-4 11.6-8.6l2.3-5.9c.1-.3.1-.5 0-.8C84.5 14.9 74.5 7 62.5 7 52.2 7 43.4 13 39.3 21.6c-2.2-1.6-4.9-2.5-7.9-2.5-6.8 0-12.4 5.1-13.4 11.7C8.9 31.8 3 38.1 3 45.7c0 1 .1 2 .3 2.9.1.5.5.9 1 .9H75.1c.6 0 1.1-.4 1.2-.9l-.2-3.1z" fill="#F6821F"/>
-    <path d="M91.2 31.8c-.4 0-.7 0-1.1.1-.2 0-.3.2-.4.3l-1.2 4.1c-.5 1.6-.3 3 .5 4.1.8 1 2 1.6 3.5 1.7l7.5.5c.3 0 .6.2.8.4.2.2.2.5.1.8-.2.5-.8.9-1.4.9l-7.8.5c-4.8.2-9.8 4-11.6 8.6l-.6 1.7c-.1.3 0 .6.3.7.1 0 .2.1.3.1H106c.5 0 .9-.3 1-.7.5-1.7.8-3.5.8-5.4-.1-9.4-7.8-17.4-16.6-17.4z" fill="#FBAD41"/>
-  </svg>;
-}
-
-/**
- * Signing in to Cloudflare instead of copying keys, in whatever state it is in.
- *
- * One row, because it is one question - which account the backups go to - and
- * its answer changes: nothing yet, pick an account, this account, or sign in
- * again. Which bucket of that account is folded into this same row once
- * connected, rather than a separate row underneath repeating the bucket name.
- *
- * When manual keys are already the chosen method and this account is not yet
- * connected, `compact` renders a single quiet link instead of the full
- * sign-in invitation - keys were already picked, so the Cloudflare button is
- * an alternative worth mentioning once, not a second row demanding attention.
- */
-function CloudflareRow({ t, status, mode, busy, account, onAccountChange, onConnect, onChooseAccount, onDisconnect, onUseForBackups, onChangeBucket, compact }: {
-  t: Translate;
-  status: NonNullable<R2Config['cloudflare']>;
-  mode: R2Config['mode'];
-  busy: boolean;
-  account: string;
-  onAccountChange: (id: string) => void;
-  onConnect: () => void;
-  onChooseAccount: () => void;
-  onDisconnect: () => void;
-  onUseForBackups: () => void;
-  onChangeBucket: () => void;
-  compact: boolean;
-}) {
-  // Cloudflare's own colour and mark, because this button hands the reader over
-  // to Cloudflare and they decide whether to trust it by recognising it.
-  const brand = { backgroundColor: CLOUDFLARE_ORANGE, color: '#fff' };
-  if (status.state === 'disconnected') {
-    if (compact) return <Button variant="link" size="sm" className="h-auto justify-start p-0 text-xs text-muted-foreground" onClick={onConnect} disabled={busy}>{t('console.cfConnectInstead')}</Button>;
-    return <DetailRow label={t('console.cfRow')} hint={t('console.cfConnectHint')}>
-      <Button size="sm" style={brand} className="hover:opacity-90" onClick={onConnect} disabled={busy}><CloudflareMark />{t('console.cfConnect')}</Button>
-    </DetailRow>;
-  }
-  if (status.state === 'reconnect_required') {
-    return <DetailRow label={t('console.cfRow')} hint={t('console.cfReconnectHint')}>
-      <Button size="sm" style={brand} className="hover:opacity-90" onClick={onConnect} disabled={busy}><RefreshCw />{t('console.cfReconnect')}</Button>
-      <Button variant="ghost" size="sm" onClick={onDisconnect} disabled={busy}>{t('console.cfDisconnect')}</Button>
-    </DetailRow>;
-  }
-  if (status.state === 'choose_account') {
-    return <DetailRow label={t('console.cfRow')} hint={t('console.cfChooseAccount')}>
-      <Select value={account} onValueChange={onAccountChange}>
-        <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>
-        <SelectContent>
-          {status.accounts.map((entry) => <SelectItem key={entry.id} value={entry.id}>{entry.name}</SelectItem>)}
-        </SelectContent>
-      </Select>
-      <Button size="sm" onClick={onChooseAccount} disabled={busy || !account}>{t('console.cfUseAccount')}</Button>
-    </DetailRow>;
-  }
-  const described = t('console.cfConnectedAs', { account: status.account?.name ?? '', bucket: status.bucket ?? '' });
-  // Keys, not this account, are the ones actually running backups here - so
-  // switching to it is offered as a link beside a ghost Disconnect, the same
-  // quiet weight as the rest of this row, rather than a solid button that
-  // outweighs the keys row actually doing the work.
-  if (mode === 'keys') {
-    return <DetailRow label={t('console.cfRow')} hint={`${described} · ${t('console.cfUsingKeys')}`}>
-      <Button variant="link" size="sm" className="h-auto p-0" onClick={onUseForBackups} disabled={busy}>{t('console.cfUseForBackupsLink')}</Button>
-      <Button variant="ghost" size="sm" onClick={onDisconnect} disabled={busy}>{t('console.cfDisconnect')}</Button>
-    </DetailRow>;
-  }
-  return <DetailRow label={t('console.cfRow')} hint={described}>
-    <Button variant="outline" size="sm" onClick={onChangeBucket} disabled={busy}>{t('console.cfBucketChange')}</Button>
-    <Button variant="outline" size="sm" onClick={onDisconnect} disabled={busy}>{t('console.cfDisconnect')}</Button>
-  </DetailRow>;
 }
 
 /**
@@ -3904,6 +4404,43 @@ function configFileName(path: string): string {
  * looking at the field; the server checks it again, because a panel is not what
  * guarantees two services do not land on one port.
  */
+/**
+ * What the manager does with SillyTavern when it opens.
+ *
+ * Its own card rather than a row among SillyTavern's settings: everything
+ * there is written into the installed runtime's config.yaml and belongs to the
+ * version installed. This belongs to the manager and outlives every version it
+ * installs - which is also why it is not in the file the Edit button opens.
+ */
+function StartupCard({ t, startup, onSetAutoStart }: { t: Translate; startup: StartupSettings | null; onSetAutoStart: (enabled: boolean) => Promise<string | null> }) {
+  // What the switch shows while the answer is in flight, so it moves under the
+  // press rather than a second later.
+  const [pending, setPending] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const { toast } = useToast();
+  const checked = pending ?? startup?.autoStartSillyTavern ?? null;
+  const save = async (next: boolean) => {
+    setPending(next); setBusy(true);
+    try {
+      const failure = await onSetAutoStart(next);
+      if (failure) { toast({ title: failure, tone: 'destructive' }); return; }
+      // Not `configSaved`: nothing was written into SillyTavern's own config and
+      // nothing restarted. What changed is what the next start will do.
+      toast({ title: t('console.startupSaved'), tone: 'success' });
+    } finally { setPending(null); setBusy(false); }
+  };
+  return <Card>
+    <PanelHeading icon={<Play />}>{t('console.startupTitle')}</PanelHeading>
+    <CardContent>
+      <DetailRow label={t('console.autoStartSillyTavern')} hint={t('console.autoStartSillyTavernHint')}>
+        {checked === null
+          ? <Skeleton className="h-5 w-9" />
+          : <Switch checked={checked} disabled={busy} onCheckedChange={(next) => void save(next)} aria-label={t('console.autoStartSillyTavern')} />}
+      </DetailRow>
+    </CardContent>
+  </Card>;
+}
+
 function PortsCard({ t, ports, process, busy, onPortChange }: { t: Translate; ports: PortSettings | null; process: ProcessState; busy: boolean; onPortChange: (port: number) => Promise<string | null> }) {
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -3978,7 +4515,7 @@ function SettingsGroup({ icon, title }: { icon: ReactNode; title: string }) {
   </div>;
 }
 
-function ConfigPage({ t, locale, config, security, ports, managerTunnel, process, catalog, onSetManagerTunnel, onPortChange, onConfigUpdate, onConfigReset, onChangeManagerPassword, onSetPassword, onSignOut, onSignOutDevices }: { t: Translate; locale: LocaleCode; config: ConfigDocument | null; security: AccessGatewayState; ports: PortSettings | null; managerTunnel: TunnelState; process: ProcessState; catalog: Record<string, unknown>; onSetManagerTunnel: (on: boolean) => Promise<string | null>; onPortChange: (port: number) => Promise<string | null>; onConfigUpdate: (input: ConfigUpdateInput) => Promise<string | null>; onConfigReset: () => Promise<string | null>; onChangeManagerPassword: (password: string, confirmPassword: string) => Promise<string | null>; onSetPassword: (password: string, confirmPassword: string) => Promise<string | null>; onSignOut: () => Promise<void>; onSignOutDevices: () => Promise<string | null> }) {
+function ConfigPage({ t, locale, config, security, ports, managerTunnel, process, catalog, startup, onSetAutoStart, onSetManagerTunnel, onPortChange, onConfigUpdate, onConfigReset, onChangeManagerPassword, onSetPassword, onSignOut, onSignOutDevices }: { t: Translate; locale: LocaleCode; config: ConfigDocument | null; security: AccessGatewayState; ports: PortSettings | null; managerTunnel: TunnelState; process: ProcessState; catalog: Record<string, unknown>; startup: StartupSettings | null; onSetAutoStart: (enabled: boolean) => Promise<string | null>; onSetManagerTunnel: (on: boolean) => Promise<string | null>; onPortChange: (port: number) => Promise<string | null>; onConfigUpdate: (input: ConfigUpdateInput) => Promise<string | null>; onConfigReset: () => Promise<string | null>; onChangeManagerPassword: (password: string, confirmPassword: string) => Promise<string | null>; onSetPassword: (password: string, confirmPassword: string) => Promise<string | null>; onSignOut: () => Promise<void>; onSignOutDevices: () => Promise<string | null> }) {
   const [form, setForm] = useState<ConfigSettingsInput>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -3998,17 +4535,15 @@ function ConfigPage({ t, locale, config, security, ports, managerTunnel, process
   // cloudflared has finished connecting - the same reading the sharing card
   // uses, for the same reason.
   const managerTunnelWanted = managerTunnel.mode !== 'off';
-  const managerTunnelLink = managerTunnel.url;
-  const copyManagerTunnelLink = async (link: string) => {
-    try {
-      await navigator.clipboard.writeText(link);
-      toast({ title: t('console.linkCopied'), tone: 'success' });
-    } catch {
-      // The address is on the row and can be selected; a clipboard the browser
-      // will not hand over is not worth more than saying so.
-      toast({ title: t('console.copyFailed'), tone: 'destructive' });
-    }
-  };
+  /*
+   * The address to show for the console's own link.
+   *
+   * The Worker's, when Cloudflare is signed in: it is the same address every
+   * time, which is the only kind worth writing down or putting on a phone. The
+   * tunnel's own is shown underneath it rather than instead of it, because it
+   * is what the traffic really goes through and it changes on every restart.
+   */
+  const managerTunnelLink = managerTunnel.proxyUrl ?? managerTunnel.url;
   const applyManagerTunnel = async (on: boolean) => {
     setManagerTunnelBusy(true); setManagerTunnelError(null);
     try {
@@ -4117,13 +4652,23 @@ function ConfigPage({ t, locale, config, security, ports, managerTunnel, process
               the console - which is the side that installs software and holds
               the Cloudflare tokens. It belongs next to the password that is the
               only thing guarding it. */}
+          {/* The address in full, and clickable, rather than a shortened
+              fragment beside a Copy button. What somebody wants from this row
+              is to be at that page, or to send it to a phone - and a link they
+              can press does the first and lets them copy the second for
+              themselves. The button beside it opens the same address, for a
+              reader whose eye goes to the buttons rather than to the text. */}
           <DetailRow
-            label={<span className="flex flex-wrap items-center gap-2">{t('console.managerTunnel')}{managerTunnelLink ? <code className="font-mono text-xs text-muted-foreground">{shortenHost(managerTunnelLink.replace(/^https?:\/\//u, ''))}</code> : null}</span>}
-            hint={t('console.managerTunnelHint')}
+            label={t('console.managerTunnel')}
+            hint={managerTunnelLink
+              ? <a className="break-all font-mono underline underline-offset-4" href={managerTunnelLink} target="_blank" rel="noopener noreferrer">{managerTunnelLink}</a>
+              : t('console.managerTunnelHint')}
           >
             <div className="flex items-center gap-1">
               {managerTunnelLink
-                ? rowAction(<Copy />, t('dashboard.copyLink'), t('dashboard.copyLink'), () => { void copyManagerTunnelLink(managerTunnelLink); }, { variant: 'outline' })
+                ? <Button variant="outline" size="sm" aria-label={t('console.openInTab')} title={t('console.openInTab')} asChild>
+                  <a href={managerTunnelLink} target="_blank" rel="noopener noreferrer"><ArrowUpRight /><span className="hidden sm:inline">{t('console.openInTab')}</span></a>
+                </Button>
                 : null}
               <Switch
                 checked={managerTunnelWanted}
@@ -4160,6 +4705,7 @@ function ConfigPage({ t, locale, config, security, ports, managerTunnel, process
       cancelLabel={t('common.cancel')}
       onConfirm={() => applyManagerTunnel(false)}
     />
+    <StartupCard t={t} startup={startup} onSetAutoStart={onSetAutoStart} />
     <PortsCard t={t} ports={ports} process={process} busy={busy} onPortChange={onPortChange} />
     <PasswordDialog t={t} open={managerPasswordOpen} onOpenChange={setManagerPasswordOpen} title={t('console.managerPasswordTitle')} description={t('console.managerPasswordHint')} note={t('console.passwordChangeSignsOut')} minLength={MIN_MANAGER_PASSWORD} hint={t('console.managerPasswordMin')} submitLabel={t('console.changePassword')} onSubmit={saveManagerPassword} />
     <PasscodeDialog t={t} open={sillyPasswordOpen} onOpenChange={setSillyPasswordOpen} note={security.passwordConfigured ? t('console.passwordChangeSignsOut') : null} onSubmit={onSetPassword} />

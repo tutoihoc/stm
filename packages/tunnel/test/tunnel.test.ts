@@ -43,6 +43,16 @@ async function installFakeBinary(paths: ReturnType<typeof getPlatformPaths>): Pr
   await writeFile(join(paths.bin, binaryName), 'fake cloudflared', { mode: 0o755 });
 }
 
+/**
+ * A network that is not there.
+ *
+ * Every tunnel that reaches "running" asks the address it was handed whether
+ * it really answers, and no test may reach out to trycloudflare.com to find
+ * out. A request that fails proves nothing about the tunnel, so this is also
+ * what the manager is meant to do nothing about.
+ */
+const offline = (async () => { throw new Error('the network must not be reached'); }) as unknown as typeof globalThis.fetch;
+
 function waitFor(predicate: () => boolean, label: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + 5_000;
@@ -207,6 +217,7 @@ test('an exit nobody asked for is reconnected, and a requested stop is not', asy
     spawnImpl,
     env: { PATH: '' },
     reconnectDelaysMs: [5],
+    fetchImpl: offline,
     logger: (line) => { lines.push(typeof line === 'string' ? line : line.message); },
   });
 
@@ -330,6 +341,7 @@ test('a network that blocks QUIC gets HTTP/2, once it has been noticed and ever 
     spawnImpl,
     env: { PATH: '' },
     reconnectDelaysMs: [5],
+    fetchImpl: offline,
     logger: (line: Parameters<typeof lines.push>[0] | { message: string }) => {
       lines.push(typeof line === 'string' ? line : line.message);
     },
@@ -378,7 +390,7 @@ test('a tunnel that says nothing at all is given up on too, and asked again over
   }) as unknown as typeof spawnType;
   // A blocked UDP path produces no error to match on - the packets leave and
   // nothing comes back - so silence for long enough has to count as an answer.
-  const tunnel = new TunnelManager({ paths, spawnImpl, env: { PATH: '' }, quicPatienceMs: 20, logger: () => undefined });
+  const tunnel = new TunnelManager({ paths, spawnImpl, env: { PATH: '' }, quicPatienceMs: 20, fetchImpl: offline, logger: () => undefined });
 
   await tunnel.start('quick');
   assert.ok(!invocations[0]!.includes('--protocol'));
@@ -390,6 +402,105 @@ test('a tunnel that says nothing at all is given up on too, and asked again over
   // And a tunnel that is up is never taken down for being slow to start.
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.equal(invocations.length, 2);
+  await tunnel.close();
+});
+
+test('a link that answers with error 1033 is a tunnel that never reached the edge', async () => {
+  const paths = await createPaths();
+  await installFakeBinary(paths);
+  const children: FakeCloudflared[] = [];
+  const invocations: string[][] = [];
+  const lines: string[] = [];
+  const asked: string[] = [];
+  const spawnImpl = ((_command: string, args: readonly string[]): ChildProcess => {
+    invocations.push([...args]);
+    const child = fakeCloudflared();
+    children.push(child);
+    return child as unknown as ChildProcess;
+  }) as unknown as typeof spawnType;
+  // Cloudflare's own answer for a hostname with no tunnel behind it: HTTP 530,
+  // and the page says which of the many 530s it is.
+  const fetchImpl = (async (url: string | URL | Request) => {
+    asked.push(String(url));
+    return new Response('<html><body>Error 1033</body></html>', { status: 530 });
+  }) as unknown as typeof globalThis.fetch;
+  const options = {
+    paths, spawnImpl, fetchImpl,
+    env: { PATH: '' },
+    reconnectDelaysMs: [5],
+    edgeCheckDelayMs: 5,
+    logger: (line: string | { message: string }) => { lines.push(typeof line === 'string' ? line : line.message); },
+  };
+  const tunnel = new TunnelManager(options as unknown as ConstructorParameters<typeof TunnelManager>[0]);
+
+  await tunnel.start('quick');
+  // cloudflared is satisfied: it printed an address and said nothing wrong.
+  // Everything this manager could see says the tunnel is up.
+  children[0]!.stdout.write('INF |  https://cedar-married-designer-ticket.trycloudflare.com  |\n');
+  await waitFor(() => tunnel.getState().status === 'running', 'the tunnel to report running');
+
+  await waitFor(() => invocations.length === 2, 'the tunnel to be started again over HTTP/2');
+  assert.deepEqual(invocations[1]!.slice(0, 6), ['tunnel', '--no-autoupdate', '--protocol', 'http2', '--edge-ip-version', '4']);
+  assert.ok(asked.every((url) => url === 'https://cedar-married-designer-ticket.trycloudflare.com'), 'only the announced address is asked about');
+  assert.ok(lines.some((line) => line.includes('1033')), 'and the log says what the link answered');
+
+  children[1]!.stdout.write('INF |  https://spectrum-volleyball-melissa-cottage.trycloudflare.com  |\n');
+  await waitFor(() => tunnel.getState().url === 'https://spectrum-volleyball-melissa-cottage.trycloudflare.com', 'the replacement address');
+  // Already on HTTP/2, so a link that still answers 1033 has nowhere left to
+  // go: it must not start the tunnel over and over.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(invocations.length, 2);
+  await tunnel.close();
+
+  // And what was learned outlives the process that learned it.
+  assert.equal(JSON.parse(await readFile(join(paths.state, 'tunnel-config.json'), 'utf8')).transport, 'http2');
+});
+
+test('a link the manager itself cannot reach is not blamed on the transport', async () => {
+  const paths = await createPaths();
+  await installFakeBinary(paths);
+  const children: FakeCloudflared[] = [];
+  const invocations: string[][] = [];
+  const spawnImpl = ((_command: string, args: readonly string[]): ChildProcess => {
+    invocations.push([...args]);
+    const child = fakeCloudflared();
+    children.push(child);
+    return child as unknown as ChildProcess;
+  }) as unknown as typeof spawnType;
+  // The manager may sit behind a proxy that will not reach trycloudflare.com
+  // at all. That says nothing about whether the tunnel works for anybody else,
+  // so it must not cost the reader a restart onto the slower transport.
+  const tunnel = new TunnelManager({ paths, spawnImpl, fetchImpl: offline, env: { PATH: '' }, edgeCheckDelayMs: 5, edgeCheckAttempts: 3, logger: () => undefined });
+
+  await tunnel.start('quick');
+  children[0]!.stdout.write('INF |  https://cedar-married-designer-ticket.trycloudflare.com  |\n');
+  await waitFor(() => tunnel.getState().status === 'running', 'the tunnel to report running');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(invocations.length, 1, 'the tunnel is left alone');
+  await tunnel.close();
+});
+
+test('a link that answers anything else is a working tunnel, whatever the status', async () => {
+  const paths = await createPaths();
+  await installFakeBinary(paths);
+  const children: FakeCloudflared[] = [];
+  const invocations: string[][] = [];
+  const spawnImpl = ((_command: string, args: readonly string[]): ChildProcess => {
+    invocations.push([...args]);
+    const child = fakeCloudflared();
+    children.push(child);
+    return child as unknown as ChildProcess;
+  }) as unknown as typeof spawnType;
+  // The gateway behind the tunnel refuses anyone without the PIN. A refusal
+  // travelled down the tunnel to get here, which is the whole question.
+  const fetchImpl = (async () => new Response('sign in', { status: 401 })) as unknown as typeof globalThis.fetch;
+  const tunnel = new TunnelManager({ paths, spawnImpl, fetchImpl, env: { PATH: '' }, edgeCheckDelayMs: 5, edgeCheckAttempts: 3, logger: () => undefined });
+
+  await tunnel.start('quick');
+  children[0]!.stdout.write('INF |  https://cedar-married-designer-ticket.trycloudflare.com  |\n');
+  await waitFor(() => tunnel.getState().status === 'running', 'the tunnel to report running');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(invocations.length, 1);
   await tunnel.close();
 });
 

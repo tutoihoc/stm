@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { formatBytes, logEvent, logLineText, type LogSink, type Profile, type R2CloudflareUsage, type R2Config, type R2ConnectionMode, type R2UsageResponse, type R2UsageWarning, type R2EnvironmentField, type R2Object, type R2SnapshotSummary, type R2Usage, type TransferProgress } from '../../contracts/src/index.js';
+import { formatBytes, logEvent, logLineText, type LogSink, type Profile, type R2CheckResult, type R2CloudflareUsage, type R2Config, type R2ConnectionMode, type R2UsageResponse, type R2UsageWarning, type R2EnvironmentField, type R2Object, type R2SnapshotSummary, type R2Usage, type TransferProgress } from '../../contracts/src/index.js';
 import { parseS3Endpoint, R2_FREE_TIER, readR2Usage } from '../../cloudflare/src/index.js';
 import { ioConcurrency, runPooled } from '../../platform/src/index.js';
 import type { PlatformPaths } from '../../platform/src/index.js';
@@ -128,6 +128,8 @@ interface StoredR2Config {
    * to fall back on.
    */
   readonly lastSnapshot: { readonly profileId: string; readonly id: string } | null;
+  /** What the manager restored by itself on the way up; see R2Config.lastRecovery. */
+  readonly lastRecovery: { readonly at: string; readonly createdAt: string; readonly fileCount: number; readonly sizeBytes?: number } | null;
   readonly usage: StoredUsage;
 }
 
@@ -197,12 +199,6 @@ export interface R2ReconcileResult {
   readonly collectedBlobs: number;
   readonly collectedBytes: number;
   readonly usage: R2Usage;
-}
-
-export interface R2ConnectionResult {
-  readonly ok: true;
-  readonly objectCount: number;
-  readonly totalBytes: number;
 }
 
 export class R2Manager {
@@ -294,14 +290,68 @@ export class R2Manager {
     return parsed && config.bucket ? { accountId: parsed.accountId, jurisdiction: parsed.jurisdiction, bucket: config.bucket } : null;
   }
 
-  public async testConnection(): Promise<R2ConnectionResult> {
-    const config = await this.load();
+  /**
+   * Read the bucket once, and say what is in it.
+   *
+   * This is the one thing the panel asks when somebody wants to know whether
+   * the connection works. It settles that by doing the thing a backup does -
+   * listing the bucket - so a listing that comes back is proof rather than a
+   * guess, and the counts it comes back with replace the ones the manager has
+   * been keeping in its head since the last time it looked. That is what the
+   * separate "Refresh" was for.
+   *
+   * What it does not do is delete anything. Collecting chunks no recovery point
+   * names is a sweep that reads every index, runs on its own daily clock, and
+   * has no business happening because somebody pressed Check.
+   *
+   * A bucket that cannot be reached is the answer, not an error: it comes back
+   * in `failure` so the panel can show it where the figures would have been.
+   */
+  public async inspect(): Promise<R2CheckResult> {
+    const checkedAt = this.now().toISOString();
+    const bucket = await this.bucketName();
     try {
+      const config = await this.requireUsable();
       const objects = await this.listAll(config, OBJECT_PREFIX);
-      return { ok: true, objectCount: objects.length, totalBytes: objects.reduce((sum, object) => sum + object.sizeBytes, 0) };
-    } finally {
+      const found = summarizeObjects(objects);
+      const previous = await this.currentPeriod(config);
+      const usage: StoredUsage = {
+        ...previous,
+        storageBytes: found.totalBytes,
+        blobCount: found.blobs.size,
+        snapshotCount: found.snapshotKeys.length,
+        legacyObjectCount: found.legacyObjectCount,
+        legacyBytes: found.legacyBytes,
+      };
+      await this.save({ ...(await this.load()), usage });
       await this.recordCharges();
+      this.logger(logEvent('r2.checked', `[r2] the bucket answered: ${objects.length} object(s), ${formatBytes(found.totalBytes)}, ${found.snapshotKeys.length} recovery point(s)`, { objects: objects.length, size: formatBytes(found.totalBytes), points: found.snapshotKeys.length }));
+      return {
+        ok: true,
+        checkedAt,
+        bucket,
+        objectCount: objects.length,
+        totalBytes: found.totalBytes,
+        snapshotCount: found.snapshotKeys.length,
+        legacyObjectCount: found.legacyObjectCount,
+        legacyBytes: found.legacyBytes,
+        usage: toPublicUsage(usage),
+        failure: null,
+      };
+    } catch (error: unknown) {
+      await this.recordCharges().catch(() => undefined);
+      const code = error instanceof R2Error ? error.code : 'r2_check_failed';
+      const message = error instanceof Error ? error.message : 'The bucket could not be read';
+      this.logger(logEvent('r2.checkFailed', `[r2] the bucket could not be read: ${message}`, { reason: message }));
+      return { ok: false, checkedAt, bucket, objectCount: 0, totalBytes: 0, snapshotCount: 0, legacyObjectCount: 0, legacyBytes: 0, usage: null, failure: { code, message } };
     }
+  }
+
+  /** What to call the bucket on screen, whichever way it is connected. */
+  private async bucketName(): Promise<string | null> {
+    const config = await this.load();
+    if (config.mode === 'cloudflare') return (await this.cloudflare?.target())?.bucket ?? null;
+    return config.bucket;
   }
 
   /**
@@ -671,6 +721,18 @@ export class R2Manager {
     return fetched?.usage && this.now().getTime() - Date.parse(fetched.usage.fetchedAt) < CLOUD_USAGE_GUARD_MAX_AGE_MS ? fetched.usage : null;
   }
 
+  /**
+   * Write down that the manager put a recovery point back by itself.
+   *
+   * Said once, on the card, because it happened while nobody was watching and
+   * the reader would otherwise have to work out from the chat history whether
+   * their data came back.
+   */
+  public async recordRecovery(recovery: { readonly createdAt: string; readonly fileCount: number; readonly sizeBytes?: number }): Promise<void> {
+    const config = await this.load();
+    await this.save({ ...config, lastRecovery: { at: this.now().toISOString(), createdAt: recovery.createdAt, fileCount: recovery.fileCount, ...(recovery.sizeBytes === undefined ? {} : { sizeBytes: recovery.sizeBytes }) } });
+  }
+
   public async markFingerprint(fingerprint: string): Promise<void> {
     const config = await this.load();
     await this.save({ ...config, lastFingerprint: fingerprint });
@@ -865,6 +927,7 @@ export class R2Manager {
       limits: { maxStorageBytes: config.maxStorageBytes, maxWriteOperations: config.maxWriteOperations, maxReadOperations: config.maxReadOperations },
       usage: toPublicUsage(config.usage),
       lastFingerprint: config.lastFingerprint,
+      lastRecovery: config.lastRecovery,
     };
   }
 
@@ -1222,6 +1285,7 @@ function defaultStoredConfig(now: Date): StoredR2Config {
     lastColdUploadAt: null,
     lastFingerprint: null,
     lastSnapshot: null,
+    lastRecovery: null,
     usage: {
       storageBytes: 0,
       blobCount: 0,

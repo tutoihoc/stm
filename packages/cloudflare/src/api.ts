@@ -59,6 +59,24 @@ export class CloudflareRateLimitError extends CloudflareApiError {
   }
 }
 
+/**
+ * Cloudflare's code for an account that has never turned R2 on.
+ *
+ * R2 is not part of an account by default: somebody has to accept its terms
+ * once, in the dashboard, and until they do every R2 call comes back with this
+ * and the sentence "Please enable R2 through the Cloudflare Dashboard". It is
+ * worth telling apart from every other refusal, because it is the only one the
+ * reader can fix in a minute and the only one where saying "the bucket could
+ * not be created" would send them looking in the wrong place.
+ */
+export const R2_NOT_ENABLED_CODE = 10042;
+
+/** Whether this failure is an account that has not turned R2 on. */
+export function isR2NotEnabled(error: unknown): boolean {
+  if (!(error instanceof CloudflareApiError)) return false;
+  return error.apiCodes.includes(R2_NOT_ENABLED_CODE) || /enable r2/iu.test(error.message);
+}
+
 export interface CloudflareApiOptions {
   /** Called for every request, so an expired token can be refreshed in between. */
   readonly accessToken: () => Promise<string>;

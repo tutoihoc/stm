@@ -34,6 +34,7 @@ export const home = {
         { icon: 'download', title: 'Install and update', body: 'Pick a release or a branch and press Install. It clones, installs dependencies, health-checks the build and reports Ready only once SillyTavern answers on its port. It tells you when a newer release is out.' },
         { icon: 'terminal', title: 'Run and watch', body: 'Start, stop and open SillyTavern from the panel, with live logs from the manager, SillyTavern, the installer, backups and the tunnel in one searchable feed.' },
         { icon: 'shield', title: 'Share safely', body: 'SillyTavern itself stays on localhost. Other devices and Cloudflare Tunnel reach it through an access gateway that asks for a passcode first and never forwards the admin panel.' },
+        { icon: 'globe', title: 'A link that keeps working', body: 'A Quick Tunnel’s address changes every time it starts. Sign in to Cloudflare and the manager puts sillytavern.<you>.workers.dev in front of it, on your own account, and moves it to each new tunnel — so the link you send stays the link that works.' },
         { icon: 'archive', title: 'Back up', body: 'Scheduled and manual ZIP archives, compatible with SillyTavern’s own exports, plus previewed restores and a safety snapshot before anything is replaced.' },
         { icon: 'cloud', title: 'Back up off-site', body: 'One button signs in to Cloudflare, finds or creates an R2 bucket in your own account and keeps recovery points there. No keys to create or paste — or bring your own S3 keys.' },
         { icon: 'chart', title: 'Know your usage', body: 'Requests, tokens, cache hits and latency per day, per provider and per model, measured from SillyTavern’s own traffic. Nothing about it leaves the machine.' },
@@ -56,18 +57,18 @@ export const home = {
     },
     how: {
       eyebrow: 'How it works',
-      heading: 'Three ports, and only one of them is ever shared',
-      lede: 'SillyTavern is never the thing exposed. The gateway is, and it asks for a passcode before it forwards anything — and it never forwards the admin panel.',
-      caption: 'The manager panel is yours alone. Everyone else arrives through the gateway.',
+      heading: 'Three ports, and two different links',
+      lede: 'SillyTavern is never the thing exposed. What you share is the gateway, which asks for a passcode and never forwards the admin panel. The panel has a separate link of its own, behind the manager password, for when the machine you need is not the one in front of you.',
+      caption: 'The link you share reaches the gateway. The panel’s own link is a different switch, and it is not for sharing.',
       table: {
         columns: ['Port', 'What listens', 'Who can reach it'],
         rows: [
-          ['7860', 'The manager panel', 'This machine, unless you expose it yourself'],
+          ['7860', 'The manager panel', 'This machine, and you from anywhere once you switch its own link on'],
           ['8000', 'SillyTavern', 'This machine only'],
           ['8001', 'The access gateway', 'Your local network or a Cloudflare Tunnel, after a passcode'],
         ],
       },
-      note: 'A tunnel and the local-network switch open the gateway, never the panel. Nobody who finds your public address can install, restore or delete anything.',
+      note: 'The link you give somebody else opens the gateway, never the panel: nobody who has it can install, restore or delete anything. Opening the panel to the internet is a second switch, in Settings, and it asks for the manager password.',
     },
     screens: {
       eyebrow: 'The panel',
@@ -130,6 +131,7 @@ export const home = {
         { icon: 'download', title: 'Cài đặt và cập nhật', body: 'Chọn một bản phát hành hoặc một nhánh rồi bấm Cài đặt. Trình quản lý clone, cài phụ thuộc, kiểm tra sức khoẻ bản dựng và chỉ báo Sẵn sàng khi SillyTavern thực sự trả lời trên cổng của nó. Có bản mới, nó sẽ nói.' },
         { icon: 'terminal', title: 'Chạy và theo dõi', body: 'Bật, tắt và mở SillyTavern ngay trong bảng điều khiển, kèm nhật ký trực tiếp từ trình quản lý, SillyTavern, trình cài đặt, sao lưu và tunnel trong một luồng tìm kiếm được.' },
         { icon: 'shield', title: 'Chia sẻ an toàn', body: 'Bản thân SillyTavern vẫn chỉ nằm ở localhost. Thiết bị khác và Cloudflare Tunnel đi qua một cổng truy cập, cổng này hỏi mã trước và không bao giờ chuyển tiếp trang quản trị.' },
+        { icon: 'globe', title: 'Link dùng được lâu dài', body: 'Địa chỉ Quick Tunnel đổi sau mỗi lần khởi động. Đăng nhập Cloudflare là trình quản lý đặt sillytavern.<bạn>.workers.dev đứng trước nó, ngay trên tài khoản của bạn, và tự trỏ sang tunnel mới — link bạn gửi đi vẫn là link chạy được.' },
         { icon: 'archive', title: 'Sao lưu', body: 'Tệp ZIP theo lịch hoặc thủ công, tương thích với bản xuất của chính SillyTavern, kèm xem trước khi phục hồi và một bản chụp an toàn trước khi có gì bị ghi đè.' },
         { icon: 'cloud', title: 'Sao lưu ra ngoài máy', body: 'Một nút đăng nhập Cloudflare, tìm hoặc tạo bucket R2 trong chính tài khoản của bạn và giữ các điểm phục hồi ở đó. Không phải tạo hay dán khoá nào — hoặc bạn tự mang khoá S3 của mình.' },
         { icon: 'chart', title: 'Biết mình dùng bao nhiêu', body: 'Số lượt gọi, token, tỷ lệ trúng bộ nhớ đệm và độ trễ theo ngày, theo nhà cung cấp và theo mô hình, đo từ chính lưu lượng của SillyTavern. Không gì trong đó rời khỏi máy.' },
@@ -152,18 +154,18 @@ export const home = {
     },
     how: {
       eyebrow: 'Cách hoạt động',
-      heading: 'Ba cổng, chỉ một cổng được mở ra ngoài',
-      lede: 'SillyTavern không bao giờ là thứ bị mở ra ngoài. Thứ mở ra là cổng truy cập, và nó hỏi mã trước khi chuyển tiếp bất cứ gì — đồng thời không bao giờ chuyển tiếp trang quản trị.',
-      caption: 'Bảng quản trị chỉ thuộc về bạn. Mọi người khác đi vào qua cổng truy cập.',
+      heading: 'Ba cổng, và hai cái link khác nhau',
+      lede: 'SillyTavern không bao giờ là thứ bị mở ra ngoài. Thứ bạn chia sẻ là cổng truy cập — nó hỏi mã và không bao giờ chuyển tiếp trang quản trị. Bảng quản trị có link riêng của nó, nằm sau mật khẩu manager, cho lúc cái máy bạn cần không phải cái máy trước mặt.',
+      caption: 'Link bạn chia sẻ dẫn tới cổng truy cập. Link riêng của bảng quản trị là một công tắc khác, và không phải để chia sẻ.',
       table: {
         columns: ['Cổng', 'Cái gì lắng nghe', 'Ai truy cập được'],
         rows: [
-          ['7860', 'Bảng quản trị', 'Chỉ máy này, trừ khi bạn tự mở ra ngoài'],
+          ['7860', 'Bảng quản trị', 'Máy này, và chính bạn từ xa khi đã bật link riêng của nó'],
           ['8000', 'SillyTavern', 'Chỉ máy này'],
           ['8001', 'Cổng truy cập', 'Mạng nội bộ hoặc Cloudflare Tunnel, sau khi nhập mã'],
         ],
       },
-      note: 'Tunnel và công tắc mạng nội bộ mở cổng truy cập, không bao giờ mở bảng quản trị. Người tìm ra địa chỉ công khai của bạn không thể cài, phục hồi hay xoá bất cứ thứ gì.',
+      note: 'Link bạn đưa cho người khác mở cổng truy cập, không bao giờ mở bảng quản trị: ai cầm link đó cũng không cài, phục hồi hay xoá được gì. Mở bảng quản trị ra internet là công tắc thứ hai, nằm trong Cài đặt, và nó hỏi mật khẩu manager.',
     },
     screens: {
       eyebrow: 'Giao diện',

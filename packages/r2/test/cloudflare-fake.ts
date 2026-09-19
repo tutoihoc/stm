@@ -12,6 +12,8 @@ export interface FakeCloudflareState {
   accessTokenSerial: number;
   expiresIn: number;
   buckets: Map<string, MemoryBucket>;
+  /** False for an account that has never accepted R2's terms; every R2 call is refused. */
+  r2Enabled: boolean;
   secrets: Map<string, string>;
   /** The bucket the deployed Worker is bound to, or null before the first deploy. */
   deployed: string | null;
@@ -35,6 +37,7 @@ export async function fakeCloudflare(overrides: Partial<FakeCloudflareState> = {
     accessTokenSerial: 0,
     expiresIn: 3600,
     buckets: new Map(),
+    r2Enabled: true,
     secrets: new Map(),
     deployed: null,
     workersDevBlocked: false,
@@ -45,7 +48,7 @@ export async function fakeCloudflare(overrides: Partial<FakeCloudflareState> = {
   };
   const worker = await loadWorker();
   const ok = (result: unknown, resultInfo?: unknown) => Response.json({ success: true, errors: [], messages: [], result, ...(resultInfo ? { result_info: resultInfo } : {}) });
-  const fail = (status: number, message: string) => Response.json({ success: false, errors: [{ code: 10000, message }], result: null }, { status });
+  const fail = (status: number, message: string, code = 10000) => Response.json({ success: false, errors: [{ code, message }], result: null }, { status });
   const issue = () => {
     state.accessTokenSerial += 1;
     state.refreshToken = `refresh-${state.accessTokenSerial}`;
@@ -89,6 +92,9 @@ export async function fakeCloudflare(overrides: Partial<FakeCloudflareState> = {
     const accountMatch = /^\/accounts\/([0-9a-f]{32})(\/.*)$/u.exec(path);
     if (!accountMatch) return fail(404, 'no route');
     const rest = accountMatch[2] ?? '';
+    // An account that has never turned R2 on. Cloudflare answers every R2 call
+    // this way, whatever else the sign-in was granted.
+    if (rest.startsWith('/r2/') && !state.r2Enabled) return fail(403, 'Please enable R2 through the Cloudflare Dashboard.', 10042);
     if (rest === '/r2/buckets' && method === 'GET') return ok({ buckets: [...state.buckets.keys()].map((name) => ({ name })) });
     if (rest === '/r2/buckets' && method === 'POST') {
       const name = (JSON.parse(String(init?.body)) as { name: string }).name;

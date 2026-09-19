@@ -42,6 +42,8 @@ SillyTavern là một cửa sổ terminal, một bản checkout Git và một th
 | **Cài đặt và cập nhật** | Chọn một bản release hoặc một branch rồi bấm **Cài đặt**. Manager tự clone, cài dependency, kiểm tra bản cài và chỉ báo **Ready** khi SillyTavern thực sự trả lời trên cổng của nó. Có bản mới, manager sẽ báo. |
 | **Chạy và theo dõi** | Bật, tắt và mở SillyTavern ngay trong panel, cùng log trực tiếp của manager, SillyTavern, trình cài đặt, sao lưu và tunnel trong một dòng tin tìm kiếm được. |
 | **Chia sẻ an toàn** | Bản thân SillyTavern chỉ nằm ở localhost. Thiết bị khác và Cloudflare Tunnel đi qua cổng truy cập của manager, cổng đó hỏi mật khẩu trước và không bao giờ chuyển tiếp bảng quản trị. |
+| **Link dùng được lâu dài** | Đăng nhập Cloudflare là manager đặt `sillytavern.<bạn>.workers.dev` và `stm.<bạn>.workers.dev` đứng trước tunnel. Hostname của Quick Tunnel đổi sau mỗi lần khởi động lại; hai địa chỉ này thì không. |
+| **Vào máy của mình từ xa** | Console có link riêng, nằm sau mật khẩu manager, để bạn quản trị máy từ nơi khác. Đó là một công tắc tách biệt với cái link bạn chia sẻ. |
 | **Sao lưu** | Archive ZIP theo lịch hoặc thủ công, tương thích với export của chính SillyTavern, kèm xem trước khi khôi phục và một safety snapshot trước khi ghi đè. |
 | **Sao lưu ngoài máy** | Một nút đăng nhập Cloudflare, tìm hoặc tạo bucket R2 và giữ các điểm khôi phục ở đó. Không phải tạo hay dán khoá nào — hoặc dùng khoá S3 của bạn. |
 | **Biết mình dùng bao nhiêu** | Số request, token, cache hit và độ trễ theo ngày, theo provider và theo model, đo từ chính lưu lượng của SillyTavern. |
@@ -101,7 +103,7 @@ npm ci
 npm start
 ```
 
-Giữ phiên Termux này chạy trong lúc dùng SillyTavern. Mở manager trên điện thoại tại `http://127.0.0.1:7860`; SillyTavern ở `http://127.0.0.1:8000`. Khi cần dùng iPhone hoặc mạng khác để truy cập, bạn có thể tạo public tunnel trong manager.
+Giữ phiên Termux này chạy trong lúc dùng SillyTavern. Mở manager trên điện thoại tại `http://127.0.0.1:7860`; SillyTavern ở `http://127.0.0.1:8002`. Khi cần dùng iPhone hoặc mạng khác để truy cập, bạn có thể tạo public tunnel trong manager.
 
 Lần sau khởi động lại:
 
@@ -141,7 +143,7 @@ npm ci
 node deploy/linux/launcher.mjs
 ```
 
-Mở `http://127.0.0.1:7860`. SillyTavern vẫn ở `http://127.0.0.1:8000`. Dừng bằng <kbd>Ctrl</kbd>+<kbd>C</kbd>, lần sau chạy lại bằng:
+Mở `http://127.0.0.1:7860`. SillyTavern vẫn ở `http://127.0.0.1:8002`. Dừng bằng <kbd>Ctrl</kbd>+<kbd>C</kbd>, lần sau chạy lại bằng:
 
 ```bash
 cd "$HOME/stm"
@@ -195,13 +197,13 @@ docker run --rm \
   sillytavern-manager
 ```
 
-Mở manager tại `http://127.0.0.1:7860`. SillyTavern vẫn chạy ở cổng nội bộ `8000`; tunnel chỉ trỏ tới cổng đó.
+Mở manager tại `http://127.0.0.1:7860`. SillyTavern vẫn chạy ở cổng nội bộ `8002`; tunnel chỉ trỏ tới cổng đó.
 
 Trên nền tảng cloud có container, mở cổng `7860`, đặt `STM_ADMIN_PASSWORD` bằng phần secret của nền tảng và mount lưu trữ persistent tại `/data`. Không đưa mật khẩu vào Dockerfile hoặc Git.
 
 Hạ tầng cloud thường tự quyết ba thứ thay bạn, và trình quản lý giờ đáp ứng cả ba mà không cần cấu hình.
 
-**Cổng.** Nền tảng chỉ định tuyến một cổng ra ngoài sẽ báo cổng đó qua biến `PORT`; trình quản lý lắng nghe ở đó, nên một repo vừa import vào là chạy được ngay từ lần đầu. Còn cổng mà trình quản lý chỉ *ưu tiên* — `7860` của chính nó, `8001` của cổng truy cập, `8000` của SillyTavern — nếu đã bị thứ khác trên máy chiếm thì nó tự nhường sang cổng trống kế tiếp và ghi lại số cổng mới. Muốn cố định thì đặt `STM_PORT` hoặc `STM_ACCESS_PORT`; cổng đã cố định sẽ được bind hoặc báo lỗi hẳn chứ không tự dời.
+**Cổng.** Nền tảng chỉ định tuyến một cổng ra ngoài sẽ báo cổng đó qua biến `PORT`; trình quản lý lắng nghe ở đó, nên một repo vừa import vào là chạy được ngay từ lần đầu. Còn cổng mà trình quản lý chỉ *ưu tiên* — `7860` của chính nó, `8001` của cổng truy cập, `8002` của SillyTavern — nếu đã bị thứ khác trên máy chiếm thì nó tự nhường sang cổng trống kế tiếp và ghi lại số cổng mới. Muốn cố định thì đặt `STM_PORT` hoặc `STM_ACCESS_PORT`; cổng đã cố định sẽ được bind hoặc báo lỗi hẳn chứ không tự dời.
 
 **Mạng.** Ở nơi UDP bị chặn đi ra, cloudflared không tới được biên của Cloudflare qua QUIC, và đường hầm cứ đứng ở *Registering tunnel* cho tới khi link báo lỗi 1033. Trình quản lý nhận ra điều đó — qua dòng lỗi, hoặc qua sự im lặng — rồi quay lại bằng HTTP/2 và ghi nhớ, nên chỉ phải chờ một lần chứ không phải mỗi lần khởi động. Đặt `STM_TUNNEL_PROTOCOL=http2` để bỏ qua bước dò.
 
@@ -237,7 +239,7 @@ Người dùng Windows nên chọn ZIP portable vì ZIP đã có sẵn Node.js. 
 
 1. Mở manager ở cổng `7860` và tạo mật khẩu quản trị.
 2. Chọn phiên bản SillyTavern; mặc định là `latest`.
-3. Bấm **Cài đặt** và chờ **Ready**. Ready nghĩa là SillyTavern đã trả lời ở cổng `8000`.
+3. Bấm **Cài đặt** và chờ **Ready**. Ready nghĩa là SillyTavern đã trả lời ở cổng `8002`.
 4. Mở link local, hoặc đặt mật khẩu SillyTavern rồi bật truy cập mạng nội bộ hay public tunnel.
 
 Mật khẩu manager và mật khẩu SillyTavern là hai mật khẩu khác nhau. Mật khẩu SillyTavern được hỏi ở trang đăng nhập do chính manager phục vụ, nên nó hoạt động giống nhau trên mọi phiên bản SillyTavern, cũ hay mới; đổi mật khẩu sẽ đăng xuất mọi thiết bị đang ở trong.
@@ -302,22 +304,37 @@ flowchart LR
   subgraph machine["Máy của bạn"]
     M["Bảng quản trị<br/>:7860"]
     G["Cổng truy cập<br/>:8001"]
-    S["SillyTavern<br/>:8000 · chỉ localhost"]
+    S["SillyTavern<br/>:8002 · chỉ localhost"]
     M --> S
     G --> S
   end
+  subgraph cf["Cloudflare, khi bạn đã đăng nhập"]
+    WS["sillytavern.&lt;bạn&gt;.workers.dev"]
+    WM["stm.&lt;bạn&gt;.workers.dev"]
+  end
   A["Bạn, trên máy này"] --> M
   B["Điện thoại hoặc laptop<br/>cùng Wi-Fi"] -- mật khẩu --> G
-  C["Cloudflare Tunnel"] -- mật khẩu --> G
+  C["Người bạn gửi link"] --> WS
+  D["Bạn, từ bất cứ đâu"] -- mật khẩu manager --> WM
+  WS -- tunnel · mật khẩu --> G
+  WM -- tunnel --> M
 ```
 
 | Cổng | Cái gì đang lắng nghe | Ai vào được |
 | --- | --- | --- |
-| `7860` | Bảng quản trị manager | Chỉ máy này, trừ khi bạn tự mở ra ngoài |
-| `8000` | SillyTavern | Chỉ máy này |
+| `7860` | Bảng quản trị manager | Máy này, và chính bạn từ xa khi đã bật link riêng của nó |
+| `8002` | SillyTavern | Chỉ máy này |
 | `8001` | Cổng truy cập | Mạng nội bộ hoặc Cloudflare Tunnel, sau khi nhập mật khẩu |
 
-Tunnel và công tắc mạng nội bộ chỉ mở cổng truy cập, không bao giờ mở bảng quản trị, nên người tìm được địa chỉ public của bạn cũng không thể cài đặt, khôi phục hay xoá bất cứ thứ gì.
+Hai công tắc tách riêng, vì hai cái link dành cho hai nhóm người khác nhau. **Cloudflare tunnel** ở trang tổng quan mở cổng truy cập — nó hỏi mật khẩu SillyTavern và không bao giờ chuyển tiếp bảng quản trị; đây là link bạn gửi cho người muốn chat cùng. **Mở trình quản lý này ra internet**, trong **Cài đặt**, mở chính console phía sau mật khẩu manager; nó để bạn quản trị máy của mình từ máy khác, không phải để chia sẻ.
+
+### Địa chỉ không đổi
+
+Cloudflare Quick Tunnel nhận một hostname ngẫu nhiên, và mỗi lần khởi động lại là một cái khác — nên cái link lưu hôm qua hôm nay đã là một cái tên chết, và điện thoại đã bookmark nó nhận `DNS_PROBE_FINISHED_NXDOMAIN` chứ không phải một trang báo hãy thử lại sau.
+
+Đăng nhập Cloudflare (đúng cái đăng nhập dùng để sao lưu) và manager đặt hai Worker nhỏ lên subdomain `workers.dev` của chính tài khoản bạn: `sillytavern.<bạn>.workers.dev` đứng trước SillyTavern và `stm.<bạn>.workers.dev` đứng trước console. Chúng chuyển tiếp tới tunnel đang chạy và được deploy lại ngay khi tunnel đổi, nên địa chỉ bạn ghi lại, bookmark hay gửi đi là của bạn mãi mãi. Lúc máy tắt, chúng trả về một trang ngắn báo đúng như vậy.
+
+Manager không deploy đè lên Worker trùng tên mà nó không tạo ra, nên tài khoản đã có sẵn một cái thì vẫn giữ nguyên — bảng điều khiển sẽ báo thay vì ghi đè. Ngắt kết nối Cloudflare sẽ xoá cả hai.
 
 Dữ liệu của bạn nằm ở đâu:
 
@@ -338,16 +355,21 @@ Restore cho xem trước trước khi ghi. Replace là chế độ mặc định
 
 ### Cloudflare R2
 
-Ở trang **Data**, chỉ cần bấm **Kết nối Cloudflare**. Đăng nhập Cloudflare, chọn tài khoản, cho phép các quyền, manager sẽ tìm hoặc tạo bucket tên `sillytavern-manager-backup` trong tài khoản đó và bắt đầu sao lưu. Không cần tạo hay dán khoá nào.
+Ở trang **Data**, **Nơi lưu bản sao lưu** là câu hỏi duy nhất, và **Kết nối Cloudflare** là bước duy nhất để trả lời. Đăng nhập Cloudflare, chọn tài khoản, cho phép các quyền, manager sẽ tìm hoặc tạo bucket tên `sillytavern-manager-backup` trong tài khoản đó và bắt đầu sao lưu. Không cần tạo hay dán khoá nào.
+
+Nếu tài khoản chưa từng bật R2, Cloudflare sẽ từ chối tạo bucket dù bạn đã cấp đủ quyền, và panel nói rõ điều đó kèm đường dẫn tới trang bật R2. R2 phải được bật một lần trong bảng điều khiển Cloudflare và Cloudflare có hỏi thẻ thanh toán trước khi bật; 10 GB đầu vẫn miễn phí và không bị tính tiền cho tới khi vượt gói miễn phí.
 
 - **Cho phép Workers** (tuỳ chọn, nên bật). Manager deploy một Worker nhỏ, cũng tên `sillytavern-manager-backup`, để chuyển dữ liệu sao lưu vào bucket. Cách này nhanh và không tốn giới hạn gọi API Cloudflare của bạn. Nếu không cho phép, sao lưu đi qua API của Cloudflare, chậm hơn, và lần sao lưu đầu có thể mất nhiều thời gian.
 - **Cho phép Account Analytics** (tuỳ chọn). Panel sẽ hiện dung lượng và số lệnh Class A/B theo số liệu của Cloudflare, cho bucket sao lưu và cho cả tài khoản so với gói miễn phí. Đây là số liệu sử dụng, không phải hoá đơn.
 - **Máy mới** kết nối cùng tài khoản sẽ thấy lại đúng bucket đó; các điểm khôi phục có sẵn trong bucket có thể lấy về và khôi phục.
 - **Ngắt kết nối** xoá khoá Worker của bản cài này và thu hồi quyền đăng nhập. Bucket và các điểm khôi phục vẫn nằm trong tài khoản của bạn. Bạn cũng có thể thu hồi quyền bất cứ lúc nào trong mục **Manage OAuth authorizations** ở hồ sơ Cloudflare.
+- **Kiểm tra** đọc bucket một lần rồi cho biết trong đó có gì — bao nhiêu đối tượng, nặng bao nhiêu, bao nhiêu điểm khôi phục — đồng thời cập nhật lại các số liệu panel đang giữ. Đây là nút duy nhất cho câu hỏi "cái này có chạy không": không còn nút nào khác để thử.
+
+Danh sách điểm khôi phục là tất cả những gì bucket đang giữ, không chỉ của máy này. Mỗi hồ sơ mang một mã do chính máy tạo ra nó đặt, nên một máy vừa dựng hôm nay có mã mà bucket chưa từng thấy; chỉ liệt kê của riêng nó thì bảng sẽ trống trơn trong khi bucket đang giữ cả năm dữ liệu. Điểm do máy khác ghi được đánh dấu, và lấy về vẫn theo đúng cách đó.
 
 Chỉ refresh token của Cloudflare được lưu, trong một file riêng mà chỉ user của bạn đọc được. Khoá Worker chỉ nằm trong bộ nhớ, đổi mỗi ngày, và mỗi bản cài có khoá riêng.
 
-**Dùng khoá S3.** Nếu không muốn đăng nhập, chọn **Khoá R2/S3 (thủ công)** và nhập endpoint, bucket, cặp khoá lấy từ trang R2 trong bảng điều khiển Cloudflare, hoặc đặt trong `.env` (xem [`.env.example`](.env.example)). Mọi storage tương thích S3 đều dùng được theo cách này.
+**Dùng khoá S3.** Nếu không muốn đăng nhập, mở **Nơi lưu bản sao lưu**, chọn **Key R2 hoặc S3** và nhập endpoint, bucket, cặp khoá lấy từ trang R2 trong bảng điều khiển Cloudflare, hoặc đặt trong `.env` (xem [`.env.example`](.env.example)). Mọi storage tương thích S3 đều dùng được theo cách này. Cả hai cách kết nối tới bucket đều nằm trong cùng một form đó; bấm lưu chính là chọn cách nào sẽ mang bản sao lưu đi.
 
 ## Cấu hình
 

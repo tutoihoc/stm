@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isLocalHostname, readTunnelOfferDeclined, saveTunnelOfferDeclined, shouldOfferManagerTunnel } from '../src/hosting.js';
+import { isLocalHostname, isThisMachine, readTunnelOfferDeclined, saveTunnelOfferDeclined, shouldOfferManagerTunnel } from '../src/hosting.js';
 
 test('an address the reader already has is not one they need a tunnel for', () => {
   for (const hostname of [
@@ -60,4 +60,16 @@ test('turning the offer down is remembered, and storage that refuses is not fata
   assert.doesNotThrow(() => saveTunnelOfferDeclined(blocked));
   assert.equal(readTunnelOfferDeclined(undefined), false);
   assert.doesNotThrow(() => saveTunnelOfferDeclined(undefined));
+});
+
+test('this machine is the loopback addresses, and nothing else', () => {
+  // The console is on the machine the reader is sitting at.
+  for (const host of ['localhost', 'st.localhost', '127.0.0.1', '127.0.0.2', '::1', '[::1]', '0.0.0.0']) {
+    assert.equal(isThisMachine(host), true, host);
+  }
+  // Reached over something. A phone on the same Wi-Fi is not this machine, and
+  // the loopback address there is the phone's own.
+  for (const host of ['192.168.1.20', '10.0.0.4', 'studio.modelscope.cn', 'example.trycloudflare.com', 'macbook.local']) {
+    assert.equal(isThisMachine(host), false, host);
+  }
 });

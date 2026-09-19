@@ -42,6 +42,8 @@ SillyTavern is a terminal, a Git checkout and a folder of data you must not lose
 | **Install and update** | Pick a release or a branch and press **Install**. The manager clones it, installs dependencies, health-checks the build and reports **Ready** only once SillyTavern answers on its port. It tells you when a newer release is out. |
 | **Run and watch** | Start, stop and open SillyTavern from the panel, with live logs from the manager, SillyTavern, the installer, backups and the tunnel in one searchable feed. |
 | **Share safely** | SillyTavern itself stays on localhost. Other devices and Cloudflare Tunnel reach it through the manager's access gateway, which asks for a password first and never forwards the admin panel. |
+| **A link that keeps working** | Sign in to Cloudflare and the manager puts `sillytavern.<you>.workers.dev` and `stm.<you>.workers.dev` in front of the tunnels. A Quick Tunnel's own hostname changes every restart; these two never do. |
+| **Reach your own machine** | The console has its own link, behind the manager password, for administering the machine from somewhere else. It is a separate switch from the one you share. |
 | **Back up** | Scheduled and manual ZIP archives, compatible with SillyTavern's own exports, plus previewed restores and a safety snapshot before anything is replaced. |
 | **Back up off-site** | One button signs in to Cloudflare, finds or creates an R2 bucket and keeps recovery points there. No keys to create or paste — or bring your own S3 keys. |
 | **Know your usage** | Requests, tokens, cache hits and latency per day, per provider and per model, measured from SillyTavern's own traffic. |
@@ -101,7 +103,7 @@ npm ci
 npm start
 ```
 
-Leave that Termux session running while SillyTavern is in use. Open the manager on the phone at `http://127.0.0.1:7860`; SillyTavern itself is at `http://127.0.0.1:8000`. The manager can create a public tunnel when you want to reach SillyTavern from an iPhone or another network.
+Leave that Termux session running while SillyTavern is in use. Open the manager on the phone at `http://127.0.0.1:7860`; SillyTavern itself is at `http://127.0.0.1:8002`. The manager can create a public tunnel when you want to reach SillyTavern from an iPhone or another network.
 
 Later starts:
 
@@ -141,7 +143,7 @@ npm ci
 node deploy/linux/launcher.mjs
 ```
 
-Open `http://127.0.0.1:7860`. SillyTavern remains at `http://127.0.0.1:8000`. Stop the process with <kbd>Ctrl</kbd>+<kbd>C</kbd>, and start it again later with:
+Open `http://127.0.0.1:7860`. SillyTavern remains at `http://127.0.0.1:8002`. Stop the process with <kbd>Ctrl</kbd>+<kbd>C</kbd>, and start it again later with:
 
 ```bash
 cd "$HOME/stm"
@@ -195,13 +197,13 @@ docker run --rm \
   sillytavern-manager
 ```
 
-Open the manager at `http://127.0.0.1:7860`. SillyTavern stays on the container's internal port `8000`; a configured tunnel points only to that port.
+Open the manager at `http://127.0.0.1:7860`. SillyTavern stays on the container's internal port `8002`; a configured tunnel points only to that port.
 
 For a hosted container platform, expose port `7860`, provide `STM_ADMIN_PASSWORD` through its secret settings and mount durable storage at `/data`. Never put the admin password in a Dockerfile or commit it to Git.
 
 Hosted platforms often decide three things for you, and the manager now meets each of them without being configured.
 
-**The port.** A platform that routes a single port from the outside world announces it in `PORT`; the manager listens there, so a repository imported into one works on the first run. A port the manager only *prefers* — its own `7860`, the access gateway's `8001`, SillyTavern's `8000` — steps aside to the next free one when something else on the machine already holds it, and writes down where it went. Set `STM_PORT` or `STM_ACCESS_PORT` to pin one deliberately; a pinned port is bound or the start fails, rather than moving.
+**The port.** A platform that routes a single port from the outside world announces it in `PORT`; the manager listens there, so a repository imported into one works on the first run. A port the manager only *prefers* — its own `7860`, the access gateway's `8001`, SillyTavern's `8002` — steps aside to the next free one when something else on the machine already holds it, and writes down where it went. Set `STM_PORT` or `STM_ACCESS_PORT` to pin one deliberately; a pinned port is bound or the start fails, rather than moving.
 
 **The network.** Where outbound UDP is blocked, cloudflared cannot reach Cloudflare's edge over QUIC, and a tunnel sits at *Registering tunnel* until the link times out with error 1033. The manager notices — from the error line, or from the silence — and comes back over HTTP/2, remembering the answer so the wait is paid once rather than at every restart. `STM_TUNNEL_PROTOCOL=http2` skips the discovery.
 
@@ -237,7 +239,7 @@ Windows users should prefer the portable ZIP, because it already includes Node.j
 
 1. Open the manager at port `7860` and create the manager administrator password.
 2. Choose a SillyTavern version — `latest` is selected by default.
-3. Press **Install** and wait for **Ready**. Ready means SillyTavern answered on port `8000`.
+3. Press **Install** and wait for **Ready**. Ready means SillyTavern answered on port `8002`.
 4. Open the local link, or set the SillyTavern password and then turn on local-network access or a public tunnel.
 
 The manager password and the SillyTavern password are two different things. The SillyTavern password is asked for by a sign-in page the manager serves, so it works the same on every SillyTavern version, old or new; changing it signs out every device that was already in.
@@ -302,22 +304,37 @@ flowchart LR
   subgraph machine["Your machine"]
     M["Manager panel<br/>:7860"]
     G["Access gateway<br/>:8001"]
-    S["SillyTavern<br/>:8000 · localhost only"]
+    S["SillyTavern<br/>:8002 · localhost only"]
     M --> S
     G --> S
   end
+  subgraph cf["Cloudflare, when you sign in"]
+    WS["sillytavern.&lt;you&gt;.workers.dev"]
+    WM["stm.&lt;you&gt;.workers.dev"]
+  end
   A["You, on this machine"] --> M
   B["Phone or laptop<br/>on the same Wi-Fi"] -- password --> G
-  C["Cloudflare Tunnel"] -- password --> G
+  C["Anyone you send the link to"] --> WS
+  D["You, from anywhere"] -- manager password --> WM
+  WS -- tunnel · password --> G
+  WM -- tunnel --> M
 ```
 
 | Port | What listens | Who can reach it |
 | --- | --- | --- |
-| `7860` | The manager panel | This machine, unless you expose it yourself |
-| `8000` | SillyTavern | This machine only |
+| `7860` | The manager panel | This machine, and you from anywhere once you switch its own link on |
+| `8002` | SillyTavern | This machine only |
 | `8001` | The access gateway | Your local network or a Cloudflare Tunnel, after a password |
 
-The tunnel and the local-network switch open the gateway, never the manager panel, so nobody who finds your public address can install, restore or delete anything.
+Two separate switches, because the two links are given to different people. **Cloudflare tunnel** on the overview opens the gateway, which asks for the SillyTavern password and never forwards the admin panel — that is the link you send to somebody you want to chat with. **Open this manager to the internet**, in **Settings**, opens the console itself behind the manager password; it is for reaching your own machine from another one, not for sharing.
+
+### Addresses that do not change
+
+A Cloudflare Quick Tunnel gets a random hostname, and a different one every time it starts — so a link saved yesterday is a dead name today, and a phone that had it bookmarked gets `DNS_PROBE_FINISHED_NXDOMAIN` rather than a page that says to try later.
+
+Sign in to Cloudflare (the same sign-in that sets up backups) and the manager puts two small Workers on your account's own `workers.dev` subdomain: `sillytavern.<you>.workers.dev` in front of SillyTavern and `stm.<you>.workers.dev` in front of the console. They forward to whichever tunnel is running and are redeployed the moment it changes, so the address you write down, bookmark or send is yours for good. While the machine is off they answer with a short page saying so.
+
+The manager will not deploy over a Worker of those names that it did not create, so an account that already has one keeps it — the panel says so instead. Disconnecting Cloudflare removes both.
 
 Where your data lives:
 
@@ -338,16 +355,21 @@ Restore previews the archive before writing. Replace is the default mode; merge 
 
 ### Cloudflare R2
 
-On the **Data** page, **Connect Cloudflare** is the one step. Sign in to Cloudflare, pick the account, allow the permissions, and the manager finds or creates a bucket named `sillytavern-manager-backup` in that account and starts backing up to it. There are no keys to create or paste.
+On the **Data** page, **Where backups go** is the one question, and **Connect Cloudflare** is the one step in answering it. Sign in to Cloudflare, pick the account, allow the permissions, and the manager finds or creates a bucket named `sillytavern-manager-backup` in that account and starts backing up to it. There are no keys to create or paste.
+
+If the account has never enabled R2, Cloudflare refuses to make the bucket however many permissions were granted, and the panel says so with a link to the page that turns it on. R2 has to be enabled once in the Cloudflare dashboard and Cloudflare asks for a card before it will; the first 10 GB stay free and nothing is charged until you pass the free tier.
 
 - **Allow Workers** (optional, recommended). The manager deploys a small Worker, also named `sillytavern-manager-backup`, that carries backup data to the bucket. It is fast and does not use your Cloudflare API rate limit. Without it, backups go through Cloudflare's API, which is slower, and a first backup can take a long time.
 - **Allow Account Analytics** (optional). The panel then shows storage and Class A/B operations as Cloudflare counts them, for the backup bucket and for the whole account against the free tier. These are usage figures, not your bill.
 - **A new machine** connects to the same account and finds the same bucket; the recovery points already in it can be brought back and restored.
 - **Disconnect** removes this installation's Worker key and revokes the sign-in. The bucket and its recovery points stay in your account. You can also revoke access at any time under **Manage OAuth authorizations** in your Cloudflare profile.
+- **Check** reads the bucket once and says what is in it - how many objects, how large, how many recovery points - and brings the panel's own figures back in line with it. It is the one button for "does this work": there is nothing else to press to find out.
+
+The recovery points shown are every one in the bucket, not only this machine's. A profile is identified by a name the machine that made it chose, so a machine set up today has one the bucket has never seen; listing only its own would show an empty table over a bucket holding a year of backups. Points written by another machine are marked, and bringing one back works the same way.
 
 Only the Cloudflare refresh token is stored, in its own file readable by your user alone. Worker keys live in memory, change every day, and each installation has its own.
 
-**S3 keys instead.** If you would rather not sign in, choose **R2/S3 keys (manual)** and enter the endpoint, bucket and key pair from the R2 page of the Cloudflare dashboard, or set them in `.env` (see [`.env.example`](.env.example)). Any S3-compatible storage works this way.
+**S3 keys instead.** If you would rather not sign in, open **Where backups go**, choose **R2 or S3 keys** and enter the endpoint, bucket and key pair from the R2 page of the Cloudflare dashboard, or set them in `.env` (see [`.env.example`](.env.example)). Any S3-compatible storage works this way. Both ways of reaching a bucket are in that one form; saving is choosing which one carries the backups.
 
 ## Configuration
 
